@@ -4,6 +4,7 @@ import random
 import re
 import sys
 import time
+import unicodedata
 from datetime import datetime
 from pathlib import Path
 
@@ -37,8 +38,8 @@ SELECTORS = {
     "next_overnight": "[data-test='button-next-overnight-stay']",
     "next_personal": "[data-test='button-next-personal-data']",
     "next_summary": "[data-test='button-next-summary']",
-    "terms_checkbox": "input[aria-label*='GTC'], input[aria-label*='CGC']",
-    "privacy_checkbox": "input[aria-label*='Privacy']",
+    "terms_checkbox": "input[aria-label*='GTC'], input[aria-label*='CGC'], input[aria-label*='AGB']",
+    "privacy_checkbox": "input[aria-label*='Privacy'], input[aria-label*='Datenschutz']",
 }
 
 ROOM_TYPE_KEYWORDS = {
@@ -209,6 +210,7 @@ def load_config(path):
         "access_to_hut": optional_str(data, "access_to_hut"),
         "allergies": optional_str(data, "allergies"),
         "comments": optional_str(data, "comments"),
+        "direction": optional_str(data, "direction"),
     }
 
     if "accept_terms" not in data:
@@ -420,12 +422,15 @@ def choose_hut_option(page, hut_name):
             return hut_name
         raise RuntimeError("No hut options available after search")
 
-    exact_matches = [i for i, text in enumerate(option_texts) if text == hut_name]
+    target_norm = normalize_text(hut_name)
+    option_norms = [normalize_text(text) for text in option_texts]
+
+    exact_matches = [i for i, text in enumerate(option_norms) if text == target_norm]
     if len(exact_matches) == 1:
         options.nth(exact_matches[0]).click()
         return option_texts[exact_matches[0]]
 
-    contains_matches = [i for i, text in enumerate(option_texts) if hut_name.lower() in text.lower()]
+    contains_matches = [i for i, text in enumerate(option_norms) if target_norm in text]
     if len(contains_matches) == 1:
         options.nth(contains_matches[0]).click()
         return option_texts[contains_matches[0]]
@@ -473,6 +478,110 @@ def choose_people_input(page, room_type):
                 return locator.nth(i)
         return locator.first if locator.count() else None
 
+    def expand_people_panel():
+        # Some huts hide the per-category people inputs behind an expansion panel titled
+        # "Num. di persone". Expanding it proactively avoids false "no input" failures.
+        headers = page.locator("mat-expansion-panel-header")
+        for i in range(headers.count()):
+            header = headers.nth(i)
+            try:
+                text = normalize_text(header.inner_text())
+            except Exception:
+                continue
+            if any(normalize_text(label) in text for label in PEOPLE_TOTAL_LABELS):
+                panel = header.locator("xpath=ancestor-or-self::mat-expansion-panel[1]")
+                try:
+                    panel_class = panel.get_attribute("class") or ""
+                except Exception:
+                    panel_class = ""
+                if "mat-expanded" not in panel_class:
+                    header.click()
+                    page.wait_for_timeout(250)
+                return panel
+        return None
+
+    def select_room_category_option(room_type_value):
+        keywords = ROOM_TYPE_KEYWORDS.get(room_type_value, [room_type_value])
+        keywords = [normalize_text(k) for k in keywords if k]
+        if not keywords:
+            return False
+
+        root = expand_people_panel()
+        root = root if root is not None else page
+
+        comboboxes = root.locator("[role='combobox']")
+        for i in range(comboboxes.count()):
+            cb = comboboxes.nth(i)
+            try:
+                if not cb.is_visible():
+                    continue
+            except Exception:
+                continue
+
+            # Open the dropdown and look for a unique option containing the room-type keyword.
+            try:
+                cb.click()
+            except Exception:
+                try:
+                    cb.click(force=True)
+                except Exception:
+                    continue
+            try:
+                page.wait_for_selector("mat-option", timeout=2000)
+            except PlaywrightTimeoutError:
+                page.keyboard.press("Escape")
+                continue
+
+            options = page.locator("mat-option")
+            option_texts = []
+            for j in range(options.count()):
+                try:
+                    option_texts.append(options.nth(j).inner_text().strip())
+                except Exception:
+                    option_texts.append("")
+            option_norms = [normalize_text(t) for t in option_texts]
+            matches = [j for j, t in enumerate(option_norms) if any(k in t for k in keywords)]
+
+            if len(matches) == 0:
+                page.keyboard.press("Escape")
+                continue
+            if len(matches) > 1:
+                raise RuntimeError(
+                    f"Ambiguous room category selection for room_type '{room_type_value}'. Options: {option_texts}"
+                )
+
+            options.nth(matches[0]).click()
+            page.wait_for_timeout(250)
+            return True
+
+        return False
+
+    def input_context_text(input_loc):
+        parts = []
+        try:
+            parts.append(input_loc.get_attribute("aria-label") or "")
+        except Exception:
+            pass
+        try:
+            parts.append(input_loc.get_attribute("placeholder") or "")
+        except Exception:
+            pass
+        try:
+            field = input_loc.locator("xpath=ancestor-or-self::mat-form-field[1]")
+            if field.count() > 0:
+                parts.append(field.first.inner_text())
+        except Exception:
+            pass
+        try:
+            panel_header = input_loc.locator(
+                "xpath=ancestor-or-self::mat-expansion-panel[1]//mat-expansion-panel-header"
+            )
+            if panel_header.count() > 0:
+                parts.append(panel_header.first.inner_text())
+        except Exception:
+            pass
+        return normalize_text(" ".join(parts))
+
     if room_type:
         keywords = ROOM_TYPE_KEYWORDS.get(room_type, [room_type])
 
@@ -512,13 +621,54 @@ def choose_people_input(page, room_type):
 
     inputs = page.locator(SELECTORS["people_input"])
     if inputs.count() == 0:
+        expand_people_panel()
+        inputs = page.locator(SELECTORS["people_input"])
+    if inputs.count() == 0:
         raise RuntimeError("No people input found")
     if room_type:
         keywords = ROOM_TYPE_KEYWORDS.get(room_type, [room_type])
+        keywords_norm = [normalize_text(k) for k in keywords if k]
+
+        matches = []
         for i in range(inputs.count()):
-            label = (inputs.nth(i).get_attribute("aria-label") or "").lower()
-            if any(keyword in label for keyword in keywords):
-                return inputs.nth(i)
+            ctx = input_context_text(inputs.nth(i))
+            if any(k in ctx for k in keywords_norm):
+                matches.append(inputs.nth(i))
+        # If we cannot match directly, some huts require selecting a category (mat-select)
+        # which then injects the room-type keyword into the field context.
+        if not matches and select_room_category_option(room_type):
+            inputs = page.locator(SELECTORS["people_input"])
+            for i in range(inputs.count()):
+                ctx = input_context_text(inputs.nth(i))
+                if any(k in ctx for k in keywords_norm):
+                    matches.append(inputs.nth(i))
+
+        visible_matches = []
+        for cand in matches:
+            try:
+                if cand.is_visible():
+                    visible_matches.append(cand)
+            except Exception:
+                continue
+        if len(visible_matches) == 1:
+            return visible_matches[0]
+        if len(matches) == 1:
+            return matches[0]
+
+        # Pragmatic fallback: if there's exactly one visible people input, use it.
+        # This covers huts where the room categories are not named as "dormitorio/zimmer"
+        # but the only available option is a dorm-style room.
+        visible_any = []
+        for i in range(inputs.count()):
+            cand = inputs.nth(i)
+            try:
+                if cand.is_visible():
+                    visible_any.append(cand)
+            except Exception:
+                continue
+        if len(visible_any) == 1:
+            return visible_any[0]
+
         raise RuntimeError(f"No people input matched room_type '{room_type}'")
     if inputs.count() == 1:
         return inputs.first
@@ -551,7 +701,12 @@ def fill_by_placeholder(page, placeholder, value):
 
 
 def normalize_text(value):
-    return re.sub(r"\s+", " ", value or "").strip().lower()
+    value = value or ""
+    # Make matching resilient to accents/umlauts in hut names and labels (e.g. "hütte" vs "hutte").
+    value = "".join(
+        ch for ch in unicodedata.normalize("NFKD", value) if unicodedata.category(ch) != "Mn"
+    )
+    return re.sub(r"\s+", " ", value).strip().lower()
 
 
 def scroll_all_scrollables(page, direction="bottom", passes=6, pause_ms=200):
@@ -762,6 +917,8 @@ def find_availability_next_button(page):
     selectors = [
         SELECTORS["next_check_availability"],
         SELECTORS["next_availability_alt"],
+        "button:has-text('WEITER')",
+        "button:has-text('Weiter')",
         "button:has-text('AVANTI')",
         "button:has-text('Continua')",
     ]
@@ -952,18 +1109,68 @@ def wait_for_overnight_form(page, timeout_ms=20000):
         raise RuntimeError("Overnight stay form did not load in time")
 
 
+def list_missing_required_fields(page):
+    """
+    Best-effort diagnostics for huts with additional required fields.
+    We use the UI convention that required labels often contain '*'.
+    """
+    missing = []
+    fields = page.locator("mat-form-field")
+
+    for i in range(fields.count()):
+        field = fields.nth(i)
+        label_loc = field.locator("mat-label")
+        if label_loc.count() == 0:
+            continue
+        try:
+            label_text = label_loc.first.inner_text().strip()
+        except Exception:
+            continue
+        if "*" not in label_text:
+            continue
+
+        inp = field.locator("input, textarea")
+        if inp.count() > 0:
+            candidate = inp.first
+            try:
+                if not candidate.is_visible():
+                    continue
+                value = (candidate.input_value() or "").strip()
+            except Exception:
+                continue
+            if not value:
+                missing.append(label_text)
+            continue
+
+        combo = field.locator("[role='combobox']")
+        if combo.count() > 0:
+            candidate = combo.first
+            try:
+                if not candidate.is_visible():
+                    continue
+                value = normalize_text(candidate.inner_text())
+            except Exception:
+                continue
+            if not value:
+                missing.append(label_text)
+            continue
+
+    return missing
+
+
 def fill_personal_value(page, label_text, value):
     if value is None:
         return
-    field = find_input_by_labels(page, [label_text])
+    labels = label_text if isinstance(label_text, (list, tuple)) else [label_text]
+    field = find_input_by_labels(page, labels)
     if field is None:
-        raise RuntimeError(f"Missing personal field '{label_text}'")
+        raise RuntimeError(f"Missing personal field. Tried labels: {labels}")
     if field.is_enabled():
         field.fill(str(value))
         return
     current = (field.input_value() or "").strip()
     if value and value.lower() not in current.lower():
-        raise RuntimeError(f"Field '{label_text}' is disabled and does not match config value")
+        raise RuntimeError(f"Personal field is disabled and does not match config value. Tried labels: {labels}")
 
 
 def select_country(page, country_value):
@@ -971,7 +1178,8 @@ def select_country(page, country_value):
         raise RuntimeError("contact.country is required")
     normalized = country_value.strip().lower()
     mapped = None
-    if normalized in {"switzerland", "ch", "svizzera", "suisse"}:
+    # Country dropdown labels depend on the wizard language.
+    if normalized in {"switzerland", "ch", "svizzera", "suisse", "schweiz"}:
         mapped = "Svizzera - CH"
     option_text = mapped or country_value
     select = page.locator("mat-select")
@@ -984,6 +1192,15 @@ def select_country(page, country_value):
             page.wait_for_selector("mat-option", timeout=DEFAULT_TIMEOUT_MS)
 
         option = page.locator("mat-option", has_text=option_text)
+        if option.count() == 0 and mapped:
+            # Try the alternative language mapping when the wizard is not Italian.
+            alt = None
+            if mapped.startswith("Svizzera"):
+                alt = "Schweiz - CH"
+            elif mapped.startswith("Schweiz"):
+                alt = "Svizzera - CH"
+            if alt:
+                option = page.locator("mat-option", has_text=alt)
         if option.count() == 0:
             option = page.locator("mat-option").filter(has_text=country_value)
         if option.count() == 0:
@@ -991,7 +1208,7 @@ def select_country(page, country_value):
         option.first.click()
         return
 
-    field = find_input_by_labels(page, ["Paese", "Country", "Nazione"])
+    field = find_input_by_labels(page, ["Paese", "Country", "Nazione", "Land"])
     if field is None:
         raise RuntimeError(f"Country field not found for '{country_value}'")
     if field.is_enabled():
@@ -1025,6 +1242,38 @@ def ensure_language_it(page):
     raise RuntimeError("UI language is not Italian. Please switch to IT and retry.")
 
 
+def ensure_language_any_of(page, allowed_languages):
+    """
+    Booking wizard content can differ per hut and may be served in IT or DE.
+    We fail fast if we end up in an unexpected language that would break label-based selectors.
+    """
+    allowed = {str(x).upper().strip() for x in allowed_languages}
+    if not allowed:
+        raise ValueError("allowed_languages must be non-empty")
+
+    # The UI shows a language indicator in the top right (e.g. IT/DE/EN).
+    # Prefer reading it; if absent, just enforce presence of at least one known label below.
+    lang = None
+    for code in ["IT", "DE", "EN", "FR"]:
+        if page.locator(f"text={code}").count() > 0:
+            # This is a heuristic; the code might appear elsewhere.
+            lang = code
+            break
+    if lang and lang in allowed:
+        return
+
+    # If no explicit code found, accept when any of the marker labels exist.
+    markers = []
+    if "IT" in allowed:
+        markers += ["AGGIUNGI PRENOTAZIONE", "Le mie prenotazioni", "Controlla disponibilità", "AVANTI", "INVIA"]
+    if "DE" in allowed:
+        markers += ["RESERVATION HINZUFÜGEN", "Meine Reservationen", "Verfügbarkeit prüfen", "WEITER", "SENDEN"]
+    if any(page.locator(f"text={m}").count() > 0 for m in markers):
+        return
+
+    raise RuntimeError(f"UI language not supported for this run. Allowed={sorted(allowed)}")
+
+
 def wait_for_visible(page, selector, timeout_ms=3000):
     try:
         page.wait_for_selector(selector, state="visible", timeout=timeout_ms)
@@ -1055,6 +1304,8 @@ def find_next_availability_button(page):
 def find_availability_continue_button(page):
     candidates = [
         SELECTORS["next_availability_alt"],
+        "button:has-text('WEITER')",
+        "button:has-text('Weiter')",
         "button:has-text('AVANTI')",
         "button:has-text('Continua')",
     ]
@@ -1081,7 +1332,13 @@ def availability_advanced(page, timeout_ms=8000):
 def enable_waitlist_if_present(page):
     scroll_all_scrollables(page, direction="bottom", passes=8, pause_ms=150)
 
-    waitlist_line = page.locator("text=/Continua\\s+e\\s+sarai\\s+messo\\s+in\\s+lista\\s+d['\\u2019 ]?attesa/i")
+    waitlist_patterns = [
+        "Continua\\s+e\\s+sarai\\s+messo\\s+in\\s+lista\\s+d['\\u2019 ]?attesa",
+        "Warteliste",
+        "waiting\\s+list",
+        "Wenn\\s+du\\s+fortf[aä]hrst,\\s+wird\\s+die\\s+gesamte\\s+Reservation\\s+auf\\s+die\\s+Warteliste\\s+gesetzt",
+    ]
+    waitlist_line = page.locator("text=/" + "|".join(waitlist_patterns) + "/i")
     deadline = time.time() + 8.0
     while time.time() < deadline and waitlist_line.count() == 0:
         page.wait_for_timeout(250)
@@ -1095,12 +1352,43 @@ def enable_waitlist_if_present(page):
     except Exception:
         pass
 
-    # Clicking the text itself often toggles the checkbox (label-bound inputs).
-    try:
-        target.click(force=True)
-        page.wait_for_timeout(200)
-    except Exception:
-        pass
+    def click_any(locator):
+        try:
+            locator.click(timeout=1500)
+            return True
+        except Exception:
+            try:
+                locator.click(force=True)
+                return True
+            except Exception:
+                return False
+
+    # Some huts use a plain checkbox with nearby text not bound as a <label>.
+    # Try to click the checkbox itself first (in the same nearby container).
+    checkbox_near = target.locator(
+        "xpath=ancestor-or-self::div[1]//input[@type='checkbox'] | "
+        "ancestor-or-self::div[2]//input[@type='checkbox'] | "
+        "ancestor-or-self::div[3]//input[@type='checkbox'] | "
+        "preceding::input[@type='checkbox'][1] | "
+        "following::input[@type='checkbox'][1]"
+    )
+    if checkbox_near.count() > 0:
+        box = checkbox_near.first
+        try:
+            box.check(force=True)
+            if box.is_checked():
+                return True
+        except Exception:
+            if click_any(box):
+                try:
+                    if box.is_checked():
+                        return True
+                except Exception:
+                    pass
+
+    # Clicking the text itself sometimes toggles the checkbox (label-bound inputs).
+    click_any(target)
+    page.wait_for_timeout(200)
 
     checkbox_candidates = [
         target.locator("xpath=ancestor-or-self::label[1]//input[@type='checkbox']"),
@@ -1171,6 +1459,8 @@ def enable_waitlist_if_present(page):
 def find_summary_submit_button(page):
     candidates = [
         SELECTORS["next_summary"],
+        "button:has-text('SENDEN')",
+        "button:has-text('Senden')",
         "button:has-text('INVIA')",
         "button:has-text('Invia')",
         "button:has-text('Conferma')",
@@ -1226,6 +1516,8 @@ def run_attempt(config, username, password, args, attempt_index=1):
         step = snap(page, screenshot_dir, step, f"hut_selected_{chosen_hut.replace(' ', '_')}")
         wait_for_booking_wizard(page, timeout_ms=WIZARD_TIMEOUT_MS)
         step = snap(page, screenshot_dir, step, "wizard_loaded")
+        # Some huts render the wizard in German; support IT/DE for the wizard flow.
+        ensure_language_any_of(page, {"IT", "DE"})
 
         select_date_range(page, config["check_in"], config["check_out"])
         step = snap(page, screenshot_dir, step, "dates_selected")
@@ -1296,14 +1588,20 @@ def run_attempt(config, username, password, args, attempt_index=1):
 
         wait_for_overnight_form(page)
         select_half_board(page, config["half_board"])
-        fill_by_labels(page, ["Di cui bambini", "Bambini"], config["stay"]["children_count"], "children_count")
-        fill_by_labels(page, ["Di cui guide alpine", "Guide alpine"], config["stay"]["guides_count"], "guides_count")
-        fill_by_labels(page, ["Vegetariani", "Vegetariano"], config["stay"]["vegetarian_count"], "vegetarian_count")
-        fill_by_labels(page, ["Pacchetto lunch", "Pacchetto pranzo", "Lunch"], config["stay"]["lunch_packages"], "lunch_packages")
-        fill_by_labels(page, ["Nome di gruppo", "Nome del gruppo", "Nome gruppo"], config["stay"]["group_name"], "group_name")
-        fill_by_labels(page, ["Accesso al rifugio", "Accesso alla capanna"], config["stay"]["access_to_hut"], "access_to_hut")
-        fill_by_labels(page, ["Allergie e intolleranze", "Allergie", "Intolleranze"], config["stay"]["allergies"], "allergies")
-        fill_by_labels(page, ["Commenti", "Note", "Osservazioni"], config["stay"]["comments"], "comments")
+        fill_by_labels(page, ["Di cui bambini", "Bambini", "Davon Kinder", "Kinder"], config["stay"]["children_count"], "children_count")
+        fill_by_labels(page, ["Di cui guide alpine", "Guide alpine", "Davon Bergfuhrer", "Bergfuhrer"], config["stay"]["guides_count"], "guides_count")
+        fill_by_labels(
+            page,
+            ["Vegetariani", "Vegetariano", "Vegetarier", "Vegetarisch"],
+            config["stay"]["vegetarian_count"],
+            "vegetarian_count",
+        )
+        fill_by_labels(page, ["Pacchetto lunch", "Pacchetto pranzo", "Lunch", "Lunchpaket", "Lunch-Paket", "Lunchpakete"], config["stay"]["lunch_packages"], "lunch_packages")
+        fill_by_labels(page, ["Nome di gruppo", "Nome del gruppo", "Nome gruppo", "Gruppenname", "Name der Gruppe"], config["stay"]["group_name"], "group_name")
+        fill_by_labels(page, ["Da quale direzione", "Von welcher Richtung", "Von welcher Seite"], config["stay"]["direction"], "direction")
+        fill_by_labels(page, ["Accesso al rifugio", "Accesso alla capanna", "Zugang zur Hutte"], config["stay"]["access_to_hut"], "access_to_hut")
+        fill_by_labels(page, ["Allergie e intolleranze", "Allergie", "Intolleranze", "Allergien", "Unvertraglichkeiten"], config["stay"]["allergies"], "allergies")
+        fill_by_labels(page, ["Commenti", "Note", "Osservazioni", "Kommentare", "Bemerkungen", "Kommentar"], config["stay"]["comments"], "comments")
         next_overnight = must_locator(page, SELECTORS["next_overnight"], "next_overnight", DEFAULT_TIMEOUT_MS).first
         if next_overnight.is_disabled() and config["allow_waitlist"]:
             enabled = enable_waitlist_if_present(page)
@@ -1311,17 +1609,21 @@ def run_attempt(config, username, password, args, attempt_index=1):
                 page.wait_for_timeout(300)
                 next_overnight = page.locator(SELECTORS["next_overnight"]).first
         if next_overnight.is_disabled():
+            missing = list_missing_required_fields(page)
+            if missing:
+                print("Overnight step missing required fields:", missing)
+            step = snap(page, screenshot_dir, step, "overnight_next_disabled")
             raise RuntimeError("Overnight step incomplete; next button disabled.")
         next_overnight.click()
         step = snap(page, screenshot_dir, step, "overnight_filled")
 
-        fill_personal_value(page, "Nome", config["contact"]["first_name"])
-        fill_personal_value(page, "Cognome", config["contact"]["last_name"])
-        fill_personal_value(page, "Indirizzo 1", config["contact"]["address_line1"])
-        fill_personal_value(page, "CAP", config["contact"]["postal_code"])
-        fill_personal_value(page, "Località", config["contact"]["city"])
-        fill_personal_value(page, "E-mail", config["contact"]["email"])
-        fill_personal_value(page, "Numero di Cellulare", config["contact"]["phone"])
+        fill_personal_value(page, ["Nome", "Vorname"], config["contact"]["first_name"])
+        fill_personal_value(page, ["Cognome", "Nachname"], config["contact"]["last_name"])
+        fill_personal_value(page, ["Indirizzo 1", "Adresse 1", "Adresse"], config["contact"]["address_line1"])
+        fill_personal_value(page, ["CAP", "PLZ"], config["contact"]["postal_code"])
+        fill_personal_value(page, ["Località", "Ort"], config["contact"]["city"])
+        fill_personal_value(page, ["E-mail", "E-Mail", "Email"], config["contact"]["email"])
+        fill_personal_value(page, ["Numero di Cellulare", "Mobiltelefon", "Handy", "Mobilfunknummer"], config["contact"]["phone"])
         select_country(page, config["contact"]["country"])
 
         next_personal = must_locator(page, SELECTORS["next_personal"], "next_personal", DEFAULT_TIMEOUT_MS)
