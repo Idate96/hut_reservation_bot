@@ -5,6 +5,11 @@ check_out: "2026-02-15"
 party_size: 2
 half_board: true
 allow_alternative_dates: false
+allow_waitlist: false
+auto_poll_if_full: false
+poll_interval_seconds: 300
+poll_jitter_seconds: 30
+poll_max_attempts: 0
 children_count: 0
 guides_count: 0
 vegetarian_count: 0

@@ -52,6 +52,9 @@ def parse_args():
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--screenshot-dir", default="screens")
     parser.add_argument("--headless", action="store_true")
+    parser.add_argument("--pause-at-payment", action="store_true")
+    parser.add_argument("--pause-seconds", type=int, default=0)
+    parser.add_argument("--confirm-submit", action="store_true")
     parser.add_argument("--poll", action="store_true")
     parser.add_argument("--interval-seconds", type=int, default=300)
     parser.add_argument("--max-attempts", type=int, default=0)
@@ -100,6 +103,13 @@ def optional_int(data, key, default=0):
         raise ValueError(f"config.{key} must be an integer") from exc
     if value < 0:
         raise ValueError(f"config.{key} must be >= 0")
+    return value
+
+
+def optional_positive_int(data, key, default):
+    value = optional_int(data, key, default)
+    if value <= 0:
+        raise ValueError(f"config.{key} must be >= 1")
     return value
 
 
@@ -170,6 +180,15 @@ def load_config(path):
 
     half_board = require_bool(data, "half_board", "config")
     allow_alternative_dates = optional_bool(data, "allow_alternative_dates", default=False)
+    allow_waitlist = optional_bool(data, "allow_waitlist", default=False)
+    auto_poll_if_full = optional_bool(data, "auto_poll_if_full", default=False)
+    poll_interval_seconds = optional_positive_int(data, "poll_interval_seconds", 300)
+    poll_jitter_seconds = optional_int(data, "poll_jitter_seconds", 30)
+    poll_max_attempts = optional_int(data, "poll_max_attempts", 0)
+    if poll_jitter_seconds < 0:
+        raise ValueError("config.poll_jitter_seconds must be >= 0")
+    if poll_max_attempts < 0:
+        raise ValueError("config.poll_max_attempts must be >= 0")
 
     stay_out = {
         "children_count": optional_int(data, "children_count", 0),
@@ -197,6 +216,11 @@ def load_config(path):
         "preferences": preferences_out,
         "half_board": half_board,
         "allow_alternative_dates": allow_alternative_dates,
+        "allow_waitlist": allow_waitlist,
+        "auto_poll_if_full": auto_poll_if_full,
+        "poll_interval_seconds": poll_interval_seconds,
+        "poll_jitter_seconds": poll_jitter_seconds,
+        "poll_max_attempts": poll_max_attempts,
         "stay": stay_out,
     }
 
@@ -258,7 +282,7 @@ def parse_calendar_period(text):
     Returns (year, month).
     """
     value = text.strip().lower()
-    match = re.match(r"^(\d{2})/(\d{4})$", value)
+    match = re.match(r"^(\d{1,2})/(\d{4})$", value)
     if match:
         month = int(match.group(1))
         year = int(match.group(2))
@@ -301,31 +325,69 @@ def ensure_calendar_month(page, target_date):
     Navigate the datepicker to the month of target_date by clicking next/prev.
     Assumes the datepicker is already open.
     """
+    def wait_overlay_clear():
+        overlay = page.locator(".overlay")
+        if overlay.count() == 0:
+            return
+        try:
+            overlay.first.wait_for(state="hidden", timeout=3000)
+        except PlaywrightTimeoutError:
+            return
+
+    def click_calendar_button(locator, js_selector):
+        wait_overlay_clear()
+        if locator.count() == 0:
+            page.evaluate(
+                "(selector) => { const el = document.querySelector(selector); if (el) el.click(); }",
+                js_selector,
+            )
+            page.wait_for_timeout(250)
+            return
+        try:
+            locator.first.click(timeout=DEFAULT_TIMEOUT_MS)
+        except PlaywrightTimeoutError:
+            try:
+                locator.first.click(force=True, timeout=DEFAULT_TIMEOUT_MS)
+            except PlaywrightTimeoutError:
+                page.evaluate(
+                    "(selector) => { const el = document.querySelector(selector); if (el) el.click(); }",
+                    js_selector,
+                )
+        page.wait_for_timeout(250)
+
     target = datetime.strptime(target_date, "%Y-%m-%d").date()
     period = page.locator(".mat-calendar-period-button").first
-    next_btn = page.locator("button.mat-calendar-next-button").first
-    prev_btn = page.locator("button.mat-calendar-previous-button").first
+    next_btn = page.locator("button.mat-calendar-next-button, button[aria-label='Next month']")
+    prev_btn = page.locator("button.mat-calendar-previous-button, button[aria-label='Previous month']")
     for _ in range(24):
         current_text = period.inner_text().strip()
         current_year, current_month = parse_calendar_period(current_text)
         if (current_year, current_month) == (target.year, target.month):
             return
         if (current_year, current_month) < (target.year, target.month):
-            next_btn.click()
+            click_calendar_button(next_btn, "button.mat-calendar-next-button, button[aria-label='Next month']")
         else:
-            prev_btn.click()
-        page.wait_for_timeout(200)
+            click_calendar_button(prev_btn, "button.mat-calendar-previous-button, button[aria-label='Previous month']")
     raise RuntimeError("Unable to navigate calendar to target month")
 
 
 def choose_hut_option(page, hut_name):
     hut_input = must_locator(page, SELECTORS["hut_input"], "hut_input", DEFAULT_TIMEOUT_MS)
     set_value(hut_input, hut_name)
+    page.keyboard.press("Enter")
     page.wait_for_timeout(500)
-    page.wait_for_selector(SELECTORS["hut_options"], timeout=DEFAULT_TIMEOUT_MS)
     options = page.locator(SELECTORS["hut_options"])
+    try:
+        page.wait_for_selector(SELECTORS["hut_options"], timeout=DEFAULT_TIMEOUT_MS)
+    except PlaywrightTimeoutError:
+        option_texts = []
+        if hut_input.first.input_value().strip():
+            return hut_name
+        raise RuntimeError("No hut options available after search")
     option_texts = [options.nth(i).inner_text().strip() for i in range(options.count())]
     if not option_texts:
+        if hut_input.first.input_value().strip():
+            return hut_name
         raise RuntimeError("No hut options available after search")
 
     exact_matches = [i for i, text in enumerate(option_texts) if text == hut_name]
@@ -343,8 +405,17 @@ def choose_hut_option(page, hut_name):
 
 def select_date_range(page, check_in, check_out):
     toggle = must_locator(page, SELECTORS["date_picker_toggle"], "date_picker_toggle", DEFAULT_TIMEOUT_MS)
-    toggle.first.click()
-    page.wait_for_selector(".mat-calendar-period-button", timeout=DEFAULT_TIMEOUT_MS)
+    toggle.first.scroll_into_view_if_needed()
+    try:
+        toggle.first.click(timeout=DEFAULT_TIMEOUT_MS)
+    except PlaywrightTimeoutError:
+        toggle.first.click(force=True)
+
+    if not wait_for_visible(page, ".mat-calendar-period-button", timeout_ms=3000):
+        date_input = page.locator("input[placeholder*='Data'], input[aria-label*='Data']")
+        if date_input.count() > 0:
+            date_input.first.click()
+        page.wait_for_selector(".mat-calendar, .mat-datepicker-content", timeout=DEFAULT_TIMEOUT_MS)
     for date_str in [check_in, check_out]:
         ensure_calendar_month(page, date_str)
         ui_date = format_date_for_ui(date_str)
@@ -358,6 +429,49 @@ def select_date_range(page, check_in, check_out):
 
 
 def choose_people_input(page, room_type):
+    def first_visible(locator):
+        for i in range(locator.count()):
+            if locator.nth(i).is_visible():
+                return locator.nth(i)
+        return locator.first if locator.count() else None
+
+    if room_type:
+        keywords = ROOM_TYPE_KEYWORDS.get(room_type, [room_type])
+
+        panels = page.locator("mat-expansion-panel")
+        for i in range(panels.count()):
+            header = panels.nth(i).locator("mat-expansion-panel-header")
+            try:
+                header_text = header.inner_text().strip().lower()
+            except Exception:
+                continue
+            if any(keyword in header_text for keyword in keywords):
+                panel_class = panels.nth(i).get_attribute("class") or ""
+                if "mat-expanded" not in panel_class:
+                    header.click()
+                    page.wait_for_timeout(200)
+                panel_inputs = panels.nth(i).locator("input")
+                selected = first_visible(panel_inputs)
+                if selected is None:
+                    raise RuntimeError(f"No people input found inside room panel '{header_text}'")
+                return selected
+
+        fields = page.locator("mat-form-field")
+        for i in range(fields.count()):
+            label_loc = fields.nth(i).locator("mat-label")
+            if label_loc.count() == 0:
+                continue
+            try:
+                label_text = label_loc.first.inner_text().strip().lower()
+            except Exception:
+                continue
+            if any(keyword in label_text for keyword in keywords):
+                field_inputs = fields.nth(i).locator("input")
+                selected = first_visible(field_inputs)
+                if selected is None:
+                    raise RuntimeError(f"Room field '{label_text}' has no input")
+                return selected
+
     inputs = page.locator(SELECTORS["people_input"])
     if inputs.count() == 0:
         raise RuntimeError("No people input found")
@@ -382,21 +496,155 @@ def fill_by_placeholder(page, placeholder, value):
     locator.first.fill(str(value))
 
 
+def normalize_text(value):
+    return re.sub(r"\s+", " ", value or "").strip().lower()
+
+
+def label_matches(text, labels):
+    normalized = normalize_text(text)
+    for label in labels:
+        if normalize_text(label) in normalized:
+            return True
+    return False
+
+
+def find_input_by_labels(page, labels):
+    def visible(locator):
+        try:
+            return locator.is_visible()
+        except Exception:
+            return False
+
+    for label in labels:
+        locator = page.locator(f"input[placeholder='{label}'], textarea[placeholder='{label}']")
+        if locator.count() > 0 and visible(locator.first):
+            return locator.first
+
+    inputs = page.locator("input, textarea")
+    for i in range(inputs.count()):
+        placeholder = inputs.nth(i).get_attribute("placeholder") or ""
+        if label_matches(placeholder, labels) and visible(inputs.nth(i)):
+            return inputs.nth(i)
+
+    for i in range(inputs.count()):
+        aria = inputs.nth(i).get_attribute("aria-label") or ""
+        if label_matches(aria, labels) and visible(inputs.nth(i)):
+            return inputs.nth(i)
+
+    fields = page.locator("mat-form-field")
+    for i in range(fields.count()):
+        label = fields.nth(i).locator("mat-label")
+        if label.count() == 0:
+            continue
+        try:
+            label_text = label.first.inner_text()
+        except Exception:
+            continue
+        if label_matches(label_text, labels):
+            field_inputs = fields.nth(i).locator("input, textarea")
+            if field_inputs.count() == 0:
+                continue
+            if visible(field_inputs.first):
+                return field_inputs.first
+
+    labels_loc = page.locator("label")
+    for i in range(labels_loc.count()):
+        try:
+            label_text = labels_loc.nth(i).inner_text()
+        except Exception:
+            continue
+        if not label_matches(label_text, labels):
+            continue
+        for_id = labels_loc.nth(i).get_attribute("for")
+        if for_id:
+            field = page.locator(f"#{for_id}")
+            if field.count() > 0 and visible(field.first):
+                return field.first
+
+    return None
+
+
+def fill_by_labels(page, labels, value, field_name):
+    if value is None:
+        return
+    if isinstance(value, (int, float)) and value == 0:
+        return
+    if isinstance(value, str) and not value.strip():
+        return
+    if not isinstance(labels, (list, tuple)) or not labels:
+        raise RuntimeError(f"Labels missing for {field_name}")
+    field = find_input_by_labels(page, labels)
+    if field is None:
+        raise RuntimeError(f"Missing field for {field_name}. Tried labels: {labels}")
+    field.fill(str(value))
+
+
 def select_half_board(page, half_board):
-    label = "Sì" if half_board else "No"
-    radio = page.locator("mat-radio-button", has_text=label)
-    if radio.count() == 0:
+    yes_labels = {"sì", "si", "yes", "ja", "oui"}
+    no_labels = {"no", "nein", "non"}
+    target_labels = yes_labels if half_board else no_labels
+
+    def radio_text(locator):
+        try:
+            return locator.inner_text().strip().lower()
+        except Exception:
+            return ""
+
+    def find_radio_in(container):
+        radios = container.locator("mat-radio-button")
+        for i in range(radios.count()):
+            text = radio_text(radios.nth(i))
+            if text in target_labels:
+                return radios.nth(i)
+        return None
+
+    container = None
+    label_locators = [
+        "text=/mezza\\s+pensione/i",
+        "text=/half\\s+board/i",
+        "text=/pensione\\s+completa/i",
+    ]
+    for label_selector in label_locators:
+        label = page.locator(label_selector)
+        if label.count() > 0:
+            container = label.first.locator("xpath=ancestor-or-self::*[self::form or self::section or self::div][1]")
+            break
+
+    if container is not None:
+        radio = find_radio_in(container)
+        if radio is not None:
+            radio.click()
+            return
+
+    radio = find_radio_in(page)
+    if radio is None:
         raise RuntimeError("Half board radio buttons not found")
-    radio.first.click()
+    radio.click()
+
+
+def wait_for_overnight_form(page):
+    selectors = [
+        "mat-radio-button",
+        "input[placeholder='Di cui bambini']",
+        "input[placeholder='Di cui guide alpine']",
+        "input[placeholder='Vegetariani']",
+        "input[placeholder='Pacchetto lunch']",
+        "input[placeholder='Nome di gruppo']",
+        "input[placeholder='Allergie e intolleranze']",
+    ]
+    for _ in range(30):
+        if any(page.locator(selector).count() > 0 for selector in selectors):
+            return
+        page.wait_for_timeout(300)
+    raise RuntimeError("Overnight stay form did not load in time")
 
 
 def fill_personal_value(page, label_text, value):
     if value is None:
         return
-    locator = page.locator(f"input[aria-label='{label_text}'], textarea[aria-label='{label_text}']")
-    if locator.count() == 0:
+    field = find_input_by_labels(page, [label_text])
+    if field is None:
         raise RuntimeError(f"Missing personal field '{label_text}'")
-    field = locator.first
     if field.is_enabled():
         field.fill(str(value))
         return
@@ -413,22 +661,131 @@ def select_country(page, country_value):
     if normalized in {"switzerland", "ch", "svizzera", "suisse"}:
         mapped = "Svizzera - CH"
     option_text = mapped or country_value
+    select = page.locator("mat-select")
+    if select.count() > 0:
+        select.first.click()
+        try:
+            page.wait_for_selector("mat-option", timeout=DEFAULT_TIMEOUT_MS)
+        except PlaywrightTimeoutError:
+            select.first.click(force=True)
+            page.wait_for_selector("mat-option", timeout=DEFAULT_TIMEOUT_MS)
 
-    select = page.locator("mat-select").first
-    select.click()
-    page.wait_for_timeout(300)
+        option = page.locator("mat-option", has_text=option_text)
+        if option.count() == 0:
+            option = page.locator("mat-option").filter(has_text=country_value)
+        if option.count() == 0:
+            raise RuntimeError(f"Country option not found for '{country_value}'")
+        option.first.click()
+        return
 
-    option = page.locator("mat-option", has_text=option_text)
-    if option.count() == 0:
-        option = page.locator("mat-option").filter(has_text=country_value)
-    if option.count() == 0:
-        raise RuntimeError(f"Country option not found for '{country_value}'")
-    option.first.click()
+    field = find_input_by_labels(page, ["Paese", "Country", "Nazione"])
+    if field is None:
+        raise RuntimeError(f"Country field not found for '{country_value}'")
+    if field.is_enabled():
+        field.fill(option_text)
+        return
+    current = (field.input_value() or "").strip().lower()
+    if option_text.strip().lower() not in current:
+        raise RuntimeError(f"Country field is disabled and does not match '{country_value}'")
+
+
+def ensure_language_it(page):
+    indicators = [
+        "AGGIUNGI PRENOTAZIONE",
+        "Le mie prenotazioni",
+        "Controlla disponibilità",
+    ]
+
+    def has_indicator():
+        return any(page.locator(f"text={text}").count() > 0 for text in indicators)
+
+    if has_indicator():
+        return
+
+    lang_button = page.locator("button:has-text('IT'), a:has-text('IT')")
+    if lang_button.count() > 0:
+        lang_button.first.click()
+        page.wait_for_timeout(500)
+        if has_indicator():
+            return
+
+    raise RuntimeError("UI language is not Italian. Please switch to IT and retry.")
+
+
+def wait_for_visible(page, selector, timeout_ms=3000):
+    try:
+        page.wait_for_selector(selector, state="visible", timeout=timeout_ms)
+        return True
+    except PlaywrightTimeoutError:
+        return False
+
+
+def find_next_availability_button(page):
+    candidates = [
+        SELECTORS["next_check_availability"],
+        "button:has-text('AVANTI')",
+    ]
+    for selector in candidates:
+        locator = page.locator(selector)
+        if locator.count() > 0:
+            return locator.first
+    raise RuntimeError("Next availability button not found")
+
+
+def find_availability_continue_button(page):
+    candidates = [
+        SELECTORS["next_availability_alt"],
+        "button:has-text('AVANTI')",
+        "button:has-text('Continua')",
+    ]
+    for selector in candidates:
+        locator = page.locator(selector)
+        if locator.count() > 0:
+            return locator.first
+    return None
+
+
+def enable_waitlist_if_present(page):
+    candidates = [
+        "mat-checkbox:has-text('lista d\\'attesa')",
+        "mat-checkbox:has-text('lista di attesa')",
+        "mat-checkbox:has-text('waiting list')",
+        "label:has-text('lista d\\'attesa')",
+        "label:has-text('lista di attesa')",
+        "label:has-text('waiting list')",
+    ]
+    for selector in candidates:
+        locator = page.locator(selector)
+        if locator.count() == 0:
+            continue
+        target = locator.first
+        try:
+            if target.get_attribute("aria-checked") != "true":
+                target.click()
+        except Exception:
+            target.click()
+        return True
+    return False
+
+
+def find_summary_submit_button(page):
+    candidates = [
+        SELECTORS["next_summary"],
+        "button:has-text('INVIA')",
+        "button:has-text('Invia')",
+        "button:has-text('Conferma')",
+        "button[type='submit']",
+    ]
+    for selector in candidates:
+        locator = page.locator(selector)
+        if locator.count() > 0:
+            return locator.first
+    raise RuntimeError("Summary submit button not found")
 
 
 def run_attempt(config, username, password, args, attempt_index=1):
     screenshot_dir = Path(args.screenshot_dir) if args.screenshot_dir else None
-    if screenshot_dir is not None and args.poll:
+    if screenshot_dir is not None and (args.poll or config["auto_poll_if_full"]):
         screenshot_dir = screenshot_dir / f"attempt_{attempt_index:04d}"
     if screenshot_dir is not None:
         screenshot_dir.mkdir(parents=True, exist_ok=True)
@@ -460,6 +817,7 @@ def run_attempt(config, username, password, args, attempt_index=1):
 
         page.goto(LIST_URL, wait_until="domcontentloaded")
         add_button = must_locator(page, SELECTORS["add_reservation_button"], "add_reservation_button", DEFAULT_TIMEOUT_MS)
+        ensure_language_it(page)
         add_button.first.click()
         step = snap(page, screenshot_dir, step, "reservation_list")
 
@@ -475,29 +833,52 @@ def run_attempt(config, username, password, args, attempt_index=1):
         page.keyboard.press("Tab")
         step = snap(page, screenshot_dir, step, "people_set")
 
-        next_check = must_locator(page, SELECTORS["next_check_availability"], "next_check_availability", DEFAULT_TIMEOUT_MS)
-        if next_check.first.is_disabled():
-            if config["allow_alternative_dates"]:
-                must_locator(page, SELECTORS["next_availability_alt"], "next_availability_alt", DEFAULT_TIMEOUT_MS).first.click()
-                page.wait_for_timeout(1000)
-            else:
+        next_check = find_next_availability_button(page)
+        next_check.scroll_into_view_if_needed()
+        try:
+            next_check.click(timeout=DEFAULT_TIMEOUT_MS)
+        except PlaywrightTimeoutError:
+            next_check.click(force=True)
+
+        if not wait_for_visible(page, SELECTORS["next_overnight"], timeout_ms=3000):
+            continue_button = find_availability_continue_button(page)
+            if continue_button is not None:
+                continue_button.scroll_into_view_if_needed()
+                continue_button.click()
+                page.wait_for_timeout(500)
+
+        if not wait_for_visible(page, SELECTORS["next_overnight"], timeout_ms=3000):
+            if config["allow_waitlist"]:
+                waitlist_enabled = enable_waitlist_if_present(page)
+                if not waitlist_enabled:
+                    raise AvailabilityNotFoundError(
+                        "Requested dates not available and no waiting list option was offered."
+                    )
+                continue_button = find_availability_continue_button(page)
+                if continue_button is None:
+                    raise AvailabilityNotFoundError("Waiting list was enabled but no continue button found.")
+                continue_button.scroll_into_view_if_needed()
+                continue_button.click()
+                page.wait_for_timeout(500)
+            elif not config["allow_alternative_dates"]:
                 raise AvailabilityNotFoundError(
-                    "Requested dates not available. Set allow_alternative_dates: true to continue."
+                    "Requested dates not available. Set allow_alternative_dates or allow_waitlist to continue."
                 )
-        if next_check.first.is_disabled():
-            raise AvailabilityNotFoundError("Availability check is still disabled after selecting dates and people.")
-        next_check.first.click()
+
+        if not wait_for_visible(page, SELECTORS["next_overnight"], timeout_ms=3000):
+            raise AvailabilityNotFoundError("Availability flow did not advance to overnight step.")
         step = snap(page, screenshot_dir, step, "availability_checked")
 
+        wait_for_overnight_form(page)
         select_half_board(page, config["half_board"])
-        fill_by_placeholder(page, "Di cui bambini", config["stay"]["children_count"])
-        fill_by_placeholder(page, "Di cui guide alpine", config["stay"]["guides_count"])
-        fill_by_placeholder(page, "Vegetariani", config["stay"]["vegetarian_count"])
-        fill_by_placeholder(page, "Pacchetto lunch", config["stay"]["lunch_packages"])
-        fill_by_placeholder(page, "Nome di gruppo", config["stay"]["group_name"])
-        fill_by_placeholder(page, "Accesso al rifugio", config["stay"]["access_to_hut"])
-        fill_by_placeholder(page, "Allergie e intolleranze", config["stay"]["allergies"])
-        fill_by_placeholder(page, "Commenti", config["stay"]["comments"])
+        fill_by_labels(page, ["Di cui bambini", "Bambini"], config["stay"]["children_count"], "children_count")
+        fill_by_labels(page, ["Di cui guide alpine", "Guide alpine"], config["stay"]["guides_count"], "guides_count")
+        fill_by_labels(page, ["Vegetariani", "Vegetariano"], config["stay"]["vegetarian_count"], "vegetarian_count")
+        fill_by_labels(page, ["Pacchetto lunch", "Pacchetto pranzo", "Lunch"], config["stay"]["lunch_packages"], "lunch_packages")
+        fill_by_labels(page, ["Nome di gruppo", "Nome del gruppo", "Nome gruppo"], config["stay"]["group_name"], "group_name")
+        fill_by_labels(page, ["Accesso al rifugio", "Accesso alla capanna"], config["stay"]["access_to_hut"], "access_to_hut")
+        fill_by_labels(page, ["Allergie e intolleranze", "Allergie", "Intolleranze"], config["stay"]["allergies"], "allergies")
+        fill_by_labels(page, ["Commenti", "Note", "Osservazioni"], config["stay"]["comments"], "comments")
         must_locator(page, SELECTORS["next_overnight"], "next_overnight", DEFAULT_TIMEOUT_MS).first.click()
         step = snap(page, screenshot_dir, step, "overnight_filled")
 
@@ -528,27 +909,43 @@ def run_attempt(config, username, password, args, attempt_index=1):
             browser.close()
             return
 
-        next_summary = must_locator(page, SELECTORS["next_summary"], "next_summary", DEFAULT_TIMEOUT_MS)
-        if next_summary.first.is_disabled():
-            raise RuntimeError("Summary step incomplete; next button disabled.")
-        next_summary.first.click()
-        step = snap(page, screenshot_dir, step, "payment_step")
+        def maybe_pause(label):
+            if not args.pause_at_payment and args.pause_seconds <= 0:
+                return
+            seconds = args.pause_seconds if args.pause_seconds > 0 else 600
+            print(f"{label}. Keeping browser open for {seconds}s.")
+            time.sleep(seconds)
+
+        submit_btn = find_summary_submit_button(page)
+        if submit_btn.is_disabled():
+            raise RuntimeError("Summary step incomplete; submit button disabled.")
+        if not args.confirm_submit:
+            print("Reached final submit step. Run with --confirm-submit to click 'Invia'.")
+            maybe_pause("Paused before submit")
+            browser.close()
+            return
+        submit_btn.click()
+        step = snap(page, screenshot_dir, step, "submission_clicked")
+        maybe_pause("Paused after submit")
         browser.close()
 
 
 def main():
     args = parse_args()
-    if args.interval_seconds <= 0:
-        raise ValueError("interval_seconds must be > 0")
-    if args.jitter_seconds < 0:
-        raise ValueError("jitter_seconds must be >= 0")
-    if args.max_attempts < 0:
-        raise ValueError("max_attempts must be >= 0")
-
     config = load_config(args.config)
     username, password = load_credentials()
 
-    if args.poll:
+    poll_enabled = args.poll or config["auto_poll_if_full"]
+    if poll_enabled:
+        interval_seconds = args.interval_seconds if args.poll else config["poll_interval_seconds"]
+        jitter_seconds = args.jitter_seconds if args.poll else config["poll_jitter_seconds"]
+        max_attempts = args.max_attempts if args.poll else config["poll_max_attempts"]
+        if interval_seconds <= 0:
+            raise ValueError("interval_seconds must be > 0")
+        if jitter_seconds < 0:
+            raise ValueError("jitter_seconds must be >= 0")
+        if max_attempts < 0:
+            raise ValueError("max_attempts must be >= 0")
         attempt = 0
         while True:
             attempt += 1
@@ -557,9 +954,9 @@ def main():
                 print("Booking flow completed.")
                 return
             except AvailabilityNotFoundError as exc:
-                if args.max_attempts and attempt >= args.max_attempts:
+                if max_attempts and attempt >= max_attempts:
                     raise
-                wait_time = args.interval_seconds + (random.randint(0, args.jitter_seconds) if args.jitter_seconds else 0)
+                wait_time = interval_seconds + (random.randint(0, jitter_seconds) if jitter_seconds else 0)
                 print(f"Attempt {attempt}: {exc}. Retrying in {wait_time}s.")
                 time.sleep(wait_time)
     else:
