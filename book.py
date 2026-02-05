@@ -1215,5 +1215,8 @@ if __name__ == "__main__":
     try:
         main()
     except Exception as exc:
-        print(f"ERROR: {exc}", file=sys.stderr)
+        import traceback
+
+        print("ERROR: unhandled exception", file=sys.stderr)
+        traceback.print_exc()
         sys.exit(1)
