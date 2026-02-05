@@ -569,6 +569,10 @@ def normalize_date_text(value):
 
 
 def find_date_range_input(page):
+    labeled = find_input_by_labels(page, ["Data Da - A", "Data (da - a)", "Date from - to", "Date range"])
+    if labeled is not None:
+        return labeled
+
     candidates = page.locator("input[placeholder*='Data'], input[aria-label*='Data']")
     for i in range(candidates.count()):
         loc = candidates.nth(i)
