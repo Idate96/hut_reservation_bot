@@ -414,7 +414,10 @@ def choose_hut_option(page, hut_name):
 
 def select_date_range(page, check_in, check_out):
     toggle = must_locator(page, SELECTORS["date_picker_toggle"], "date_picker_toggle", DEFAULT_TIMEOUT_MS)
-    toggle.first.scroll_into_view_if_needed()
+    try:
+        toggle.first.scroll_into_view_if_needed()
+    except Exception:
+        pass
     try:
         toggle.first.click(timeout=DEFAULT_TIMEOUT_MS)
     except PlaywrightTimeoutError:
@@ -985,7 +988,10 @@ def run_attempt(config, username, password, args, attempt_index=1):
         step = snap(page, screenshot_dir, step, "people_set")
 
         next_check = find_next_availability_button(page)
-        next_check.scroll_into_view_if_needed()
+        try:
+            next_check.scroll_into_view_if_needed()
+        except Exception:
+            pass
         try:
             next_check.click(timeout=DEFAULT_TIMEOUT_MS)
         except PlaywrightTimeoutError:
@@ -994,7 +1000,10 @@ def run_attempt(config, username, password, args, attempt_index=1):
         if not availability_advanced(page, timeout_ms=8000):
             continue_button = find_availability_continue_button(page)
             if continue_button is not None:
-                continue_button.scroll_into_view_if_needed()
+                try:
+                    continue_button.scroll_into_view_if_needed()
+                except Exception:
+                    pass
                 continue_button.click()
                 page.wait_for_timeout(500)
 
@@ -1008,7 +1017,10 @@ def run_attempt(config, username, password, args, attempt_index=1):
                 continue_button = find_availability_continue_button(page)
                 if continue_button is None:
                     raise AvailabilityNotFoundError("Waiting list was enabled but no continue button found.")
-                continue_button.scroll_into_view_if_needed()
+                try:
+                    continue_button.scroll_into_view_if_needed()
+                except Exception:
+                    pass
                 continue_button.click()
                 page.wait_for_timeout(500)
             elif not config["allow_alternative_dates"]:
