@@ -1,0 +1,31 @@
+login_provider: "sac"
+hut_name: "Vermigel"
+check_in: "2026-02-13"
+check_out: "2026-02-15"
+party_size: 2
+half_board: true
+allow_alternative_dates: false
+children_count: 0
+guides_count: 0
+vegetarian_count: 0
+lunch_packages: 0
+group_name: null
+access_to_hut: null
+allergies: null
+comments: null
+
+contact:
+  first_name: "Ada"
+  last_name: "Lovelace"
+  email: "ada@example.com"
+  phone: "+41 79 123 45 67"
+  address_line1: "Main Street 1"
+  city: "Zurich"
+  postal_code: "8000"
+  country: "Switzerland"
+
+preferences:
+  room_type: "dorm"
+  remarks: "Please book lower bunks if possible."
+
+accept_terms: true

@@ -1,0 +1,9 @@
+.env
+config.yaml
+config_*.yaml
+screens/
+__pycache__/
+.pytest_cache/
+.venv/
+.python-version
+playwright/.cache/
