@@ -1030,7 +1030,15 @@ def run_attempt(config, username, password, args, attempt_index=1):
         fill_by_labels(page, ["Accesso al rifugio", "Accesso alla capanna"], config["stay"]["access_to_hut"], "access_to_hut")
         fill_by_labels(page, ["Allergie e intolleranze", "Allergie", "Intolleranze"], config["stay"]["allergies"], "allergies")
         fill_by_labels(page, ["Commenti", "Note", "Osservazioni"], config["stay"]["comments"], "comments")
-        must_locator(page, SELECTORS["next_overnight"], "next_overnight", DEFAULT_TIMEOUT_MS).first.click()
+        next_overnight = must_locator(page, SELECTORS["next_overnight"], "next_overnight", DEFAULT_TIMEOUT_MS).first
+        if next_overnight.is_disabled() and config["allow_waitlist"]:
+            enabled = enable_waitlist_if_present(page)
+            if enabled:
+                page.wait_for_timeout(300)
+                next_overnight = page.locator(SELECTORS["next_overnight"]).first
+        if next_overnight.is_disabled():
+            raise RuntimeError("Overnight step incomplete; next button disabled.")
+        next_overnight.click()
         step = snap(page, screenshot_dir, step, "overnight_filled")
 
         fill_personal_value(page, "Nome", config["contact"]["first_name"])
