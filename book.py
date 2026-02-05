@@ -855,7 +855,10 @@ def find_availability_continue_button(page):
 def availability_advanced(page, timeout_ms=8000):
     if wait_for_visible(page, SELECTORS["next_overnight"], timeout_ms=min(1500, timeout_ms)):
         return True
-    if wait_for_visible(page, "text=/Pernottamento/i", timeout_ms=min(1500, timeout_ms)):
+    if (
+        wait_for_visible(page, "button:has-text('INDIETRO')", timeout_ms=min(1500, timeout_ms))
+        and page.locator(SELECTORS["date_picker_toggle"]).count() == 0
+    ):
         return True
     return wait_for_overnight_form_visible(page, timeout_ms=timeout_ms)
 
