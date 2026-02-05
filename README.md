@@ -19,7 +19,7 @@ python -m playwright install
 5. Use `allow_waitlist: true` to join the waiting list when it’s offered for your date.
 6. Use `auto_poll_if_full: true` to retry every 5 minutes when dates are unavailable or no waiting list is offered (`poll_interval_seconds: 300`).
 7. If you want polling only, set `allow_waitlist: false`.
-5. Update the `SELECTORS` map inside `book.py` if the UI changes.
+8. Update the `SELECTORS` map inside `book.py` if the UI changes.
 
 ## Run
 ```
