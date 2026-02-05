@@ -651,6 +651,13 @@ def ensure_expected_date_range(page, check_in, check_out, allow_alternative_date
     dates, raw = read_date_range_ui_dates(page)
     if len(dates) >= 2 and dates[0] == expected_start and dates[1] == expected_end:
         return
+    if len(dates) == 1 and dates[0] == expected_start:
+        # Some pages briefly expose only the start date until the UI fully hydrates.
+        page.wait_for_timeout(400)
+        dates2, raw2 = read_date_range_ui_dates(page)
+        if len(dates2) >= 2 and dates2[0] == expected_start and dates2[1] == expected_end:
+            return
+        dates, raw = dates2, raw2
     if allow_alternative_dates:
         return
 
@@ -688,6 +695,18 @@ def find_availability_next_button(page):
         "button:has-text('Continua')",
     ]
     return first_enabled_or_visible(page, selectors, "availability_next_button")
+
+
+def find_waitlist_container(page):
+    candidates = [
+        "text=/lista d['\\u2019 ]?attesa/i",
+        "text=/waiting list/i",
+    ]
+    for sel in candidates:
+        loc = page.locator(sel)
+        if loc.count() > 0:
+            return loc.first
+    return None
 
 
 def label_matches(text, labels):
@@ -996,6 +1015,10 @@ def enable_waitlist_if_present(page):
     if waitlist_text.count() == 0:
         return False
 
+    waitlist_container = waitlist_text.first.locator(
+        "xpath=ancestor-or-self::*[self::form or self::section or self::div or self::mat-dialog-container][1]"
+    )
+
     try:
         waitlist_text.first.scroll_into_view_if_needed()
     except Exception:
@@ -1062,6 +1085,15 @@ def enable_waitlist_if_present(page):
             return True
         except Exception:
             pass
+
+    try:
+        if waitlist_container.count() > 0:
+            local_box = waitlist_container.first.locator("input[type='checkbox'], mat-checkbox")
+            if local_box.count() > 0:
+                local_box.first.click(force=True)
+                return True
+    except Exception:
+        pass
 
     try:
         js_clicked = page.evaluate(
@@ -1200,8 +1232,10 @@ def run_attempt(config, username, password, args, attempt_index=1):
                     raise AvailabilityNotFoundError(
                         "Requested dates not available and no waiting list option was offered."
                     )
+                step = snap(page, screenshot_dir, step, "waitlist_enabled")
                 continue_button = find_availability_next_button(page)
                 if continue_button.is_disabled():
+                    step = snap(page, screenshot_dir, step, "waitlist_enabled_but_button_disabled")
                     raise AvailabilityNotFoundError("Waiting list was enabled but continue button is still disabled.")
                 continue_button.click()
                 page.wait_for_timeout(800)
