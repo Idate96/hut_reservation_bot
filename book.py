@@ -560,6 +560,89 @@ def slugify(value):
     return normalized.strip("_")
 
 
+def normalize_date_text(value):
+    value = (value or "").strip()
+    value = value.replace("\u2013", "-").replace("\u2014", "-").replace("\u2212", "-")
+    value = value.replace("\u2019", "'")
+    value = re.sub(r"\s+", " ", value)
+    return value.strip()
+
+
+def find_date_range_input(page):
+    candidates = page.locator("input[placeholder*='Data'], input[aria-label*='Data']")
+    for i in range(candidates.count()):
+        loc = candidates.nth(i)
+        try:
+            if loc.is_visible():
+                return loc
+        except Exception:
+            continue
+    if candidates.count() > 0:
+        return candidates.first
+    raise RuntimeError("Date range input not found on availability step")
+
+
+def expected_date_range_value(check_in, check_out):
+    return f"{format_date_for_ui(check_in)} - {format_date_for_ui(check_out)}"
+
+
+def date_range_matches(value, expected_value):
+    normalized = normalize_date_text(value)
+    expected = normalize_date_text(expected_value)
+    left, right = [part.strip() for part in expected.split("-", 1)]
+    return left in normalized and right in normalized
+
+
+def ensure_expected_date_range(page, check_in, check_out, allow_alternative_dates):
+    expected = expected_date_range_value(check_in, check_out)
+    date_input = find_date_range_input(page)
+    try:
+        current = date_input.input_value()
+    except Exception:
+        current = date_input.get_attribute("value") or ""
+    if date_range_matches(current, expected):
+        return
+    if allow_alternative_dates:
+        return
+    select_date_range(page, check_in, check_out)
+    date_input = find_date_range_input(page)
+    current = date_input.input_value()
+    if not date_range_matches(current, expected):
+        raise RuntimeError(
+            f"Date range changed unexpectedly. Expected '{expected}', got '{normalize_date_text(current)}'."
+        )
+
+
+def first_enabled_or_visible(page, selectors, name):
+    visible_fallback = None
+    for selector in selectors:
+        locator = page.locator(selector)
+        for idx in range(locator.count()):
+            candidate = locator.nth(idx)
+            try:
+                if not candidate.is_visible():
+                    continue
+                if visible_fallback is None:
+                    visible_fallback = candidate
+                if not candidate.is_disabled():
+                    return candidate
+            except Exception:
+                continue
+    if visible_fallback is not None:
+        return visible_fallback
+    raise RuntimeError(f"{name} not found. Tried: {selectors}")
+
+
+def find_availability_next_button(page):
+    selectors = [
+        SELECTORS["next_check_availability"],
+        SELECTORS["next_availability_alt"],
+        "button:has-text('AVANTI')",
+        "button:has-text('Continua')",
+    ]
+    return first_enabled_or_visible(page, selectors, "availability_next_button")
+
+
 def label_matches(text, labels):
     normalized = normalize_text(text)
     for label in labels:
@@ -855,11 +938,6 @@ def find_availability_continue_button(page):
 def availability_advanced(page, timeout_ms=8000):
     if wait_for_visible(page, SELECTORS["next_overnight"], timeout_ms=min(1500, timeout_ms)):
         return True
-    if (
-        wait_for_visible(page, "button:has-text('INDIETRO')", timeout_ms=min(1500, timeout_ms))
-        and page.locator(SELECTORS["date_picker_toggle"]).count() == 0
-    ):
-        return True
     return wait_for_overnight_form_visible(page, timeout_ms=timeout_ms)
 
 
@@ -1032,48 +1110,54 @@ def run_attempt(config, username, password, args, attempt_index=1):
 
         select_date_range(page, config["check_in"], config["check_out"])
         step = snap(page, screenshot_dir, step, "dates_selected")
+        ensure_expected_date_range(page, config["check_in"], config["check_out"], config["allow_alternative_dates"])
 
         set_party_size_inputs(page, config["party_size"], config["preferences"].get("room_type"))
         page.keyboard.press("Tab")
         step = snap(page, screenshot_dir, step, "people_set")
+        ensure_expected_date_range(page, config["check_in"], config["check_out"], config["allow_alternative_dates"])
 
-        next_check = find_next_availability_button(page)
-        try:
-            next_check.scroll_into_view_if_needed()
-        except Exception:
-            pass
+        next_check = find_availability_next_button(page)
+        if next_check.is_disabled() and config["allow_waitlist"]:
+            ensure_expected_date_range(page, config["check_in"], config["check_out"], allow_alternative_dates=False)
+            enabled = enable_waitlist_if_present(page)
+            if enabled:
+                page.wait_for_timeout(300)
+                next_check = find_availability_next_button(page)
+        if next_check.is_disabled():
+            raise AvailabilityNotFoundError("Availability step cannot continue (button disabled).")
         try:
             next_check.click(timeout=DEFAULT_TIMEOUT_MS)
         except PlaywrightTimeoutError:
             next_check.click(force=True)
 
         if not availability_advanced(page, timeout_ms=8000):
-            continue_button = find_availability_continue_button(page)
-            if continue_button is not None:
-                try:
-                    continue_button.scroll_into_view_if_needed()
-                except Exception:
-                    pass
-                continue_button.click()
-                page.wait_for_timeout(500)
+            continue_button = find_availability_next_button(page)
+            if continue_button.is_disabled() and config["allow_waitlist"]:
+                ensure_expected_date_range(page, config["check_in"], config["check_out"], allow_alternative_dates=False)
+                enabled = enable_waitlist_if_present(page)
+                if enabled:
+                    page.wait_for_timeout(300)
+                    continue_button = find_availability_next_button(page)
+            if continue_button.is_disabled():
+                raise AvailabilityNotFoundError("Availability step cannot continue (button disabled).")
+            continue_button.click()
+            page.wait_for_timeout(800)
 
         if not availability_advanced(page, timeout_ms=8000):
             if config["allow_waitlist"]:
+                ensure_expected_date_range(page, config["check_in"], config["check_out"], allow_alternative_dates=False)
                 waitlist_enabled = enable_waitlist_if_present(page)
                 if not waitlist_enabled:
                     step = snap(page, screenshot_dir, step, "waitlist_not_found")
                     raise AvailabilityNotFoundError(
                         "Requested dates not available and no waiting list option was offered."
                     )
-                continue_button = find_availability_continue_button(page)
-                if continue_button is None:
-                    raise AvailabilityNotFoundError("Waiting list was enabled but no continue button found.")
-                try:
-                    continue_button.scroll_into_view_if_needed()
-                except Exception:
-                    pass
+                continue_button = find_availability_next_button(page)
+                if continue_button.is_disabled():
+                    raise AvailabilityNotFoundError("Waiting list was enabled but continue button is still disabled.")
                 continue_button.click()
-                page.wait_for_timeout(500)
+                page.wait_for_timeout(800)
             elif not config["allow_alternative_dates"]:
                 raise AvailabilityNotFoundError(
                     "Requested dates not available. Set allow_alternative_dates or allow_waitlist to continue."
