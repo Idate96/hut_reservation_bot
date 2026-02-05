@@ -568,53 +568,96 @@ def normalize_date_text(value):
     return value.strip()
 
 
-def find_date_range_input(page):
-    labeled = find_input_by_labels(page, ["Data Da - A", "Data (da - a)", "Date from - to", "Date range"])
-    if labeled is not None:
-        return labeled
+def extract_ui_dates(text):
+    return re.findall(r"\b\d{2}\.\d{2}\.\d{4}\b", normalize_date_text(text))
+
+
+def find_date_range_inputs(page):
+    toggle = page.locator(SELECTORS["date_picker_toggle"])
+    if toggle.count() > 0:
+        field = toggle.first.locator("xpath=ancestor::mat-form-field[1]")
+        if field.count() > 0:
+            inputs = field.first.locator("input")
+            visible = []
+            for i in range(inputs.count()):
+                candidate = inputs.nth(i)
+                try:
+                    if candidate.is_visible():
+                        visible.append(candidate)
+                except Exception:
+                    continue
+            if visible:
+                return visible
+
+    labeled = page.locator("mat-form-field", has=page.locator("mat-label", has_text=re.compile(r"Data", re.I)))
+    for i in range(labeled.count()):
+        inputs = labeled.nth(i).locator("input")
+        visible = []
+        for j in range(inputs.count()):
+            candidate = inputs.nth(j)
+            try:
+                if candidate.is_visible():
+                    visible.append(candidate)
+            except Exception:
+                continue
+        if visible:
+            return visible
+
+    date_range = page.locator("mat-date-range-input input")
+    if date_range.count() > 0:
+        visible = []
+        for i in range(date_range.count()):
+            candidate = date_range.nth(i)
+            try:
+                if candidate.is_visible():
+                    visible.append(candidate)
+            except Exception:
+                continue
+        if visible:
+            return visible
 
     candidates = page.locator("input[placeholder*='Data'], input[aria-label*='Data']")
+    visible = []
     for i in range(candidates.count()):
-        loc = candidates.nth(i)
+        candidate = candidates.nth(i)
         try:
-            if loc.is_visible():
-                return loc
+            if candidate.is_visible():
+                visible.append(candidate)
         except Exception:
             continue
-    if candidates.count() > 0:
-        return candidates.first
-    raise RuntimeError("Date range input not found on availability step")
+    if visible:
+        return visible
+    raise RuntimeError("Date range input(s) not found on availability step")
 
 
-def expected_date_range_value(check_in, check_out):
-    return f"{format_date_for_ui(check_in)} - {format_date_for_ui(check_out)}"
-
-
-def date_range_matches(value, expected_value):
-    normalized = normalize_date_text(value)
-    expected = normalize_date_text(expected_value)
-    left, right = [part.strip() for part in expected.split("-", 1)]
-    return left in normalized and right in normalized
+def read_date_range_ui_dates(page):
+    inputs = find_date_range_inputs(page)
+    raw_parts = []
+    for input_loc in inputs:
+        try:
+            raw_parts.append(input_loc.input_value() or "")
+        except Exception:
+            raw_parts.append(input_loc.get_attribute("value") or "")
+    raw = " ".join(raw_parts)
+    dates = extract_ui_dates(raw)
+    return dates[:2], normalize_date_text(raw)
 
 
 def ensure_expected_date_range(page, check_in, check_out, allow_alternative_dates):
-    expected = expected_date_range_value(check_in, check_out)
-    date_input = find_date_range_input(page)
-    try:
-        current = date_input.input_value()
-    except Exception:
-        current = date_input.get_attribute("value") or ""
-    if date_range_matches(current, expected):
+    expected_start = format_date_for_ui(check_in)
+    expected_end = format_date_for_ui(check_out)
+    expected = f"{expected_start} - {expected_end}"
+
+    dates, raw = read_date_range_ui_dates(page)
+    if len(dates) >= 2 and dates[0] == expected_start and dates[1] == expected_end:
         return
     if allow_alternative_dates:
         return
+
     select_date_range(page, check_in, check_out)
-    date_input = find_date_range_input(page)
-    current = date_input.input_value()
-    if not date_range_matches(current, expected):
-        raise RuntimeError(
-            f"Date range changed unexpectedly. Expected '{expected}', got '{normalize_date_text(current)}'."
-        )
+    dates, raw = read_date_range_ui_dates(page)
+    if not (len(dates) >= 2 and dates[0] == expected_start and dates[1] == expected_end):
+        raise RuntimeError(f"Date range changed unexpectedly. Expected '{expected}', got '{raw}'.")
 
 
 def first_enabled_or_visible(page, selectors, name):
