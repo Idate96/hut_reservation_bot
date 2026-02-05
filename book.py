@@ -16,6 +16,7 @@ from playwright.sync_api import sync_playwright
 BASE_URL = "https://www.hut-reservation.org"
 LIST_URL = "https://www.hut-reservation.org/reservation/list"
 DEFAULT_TIMEOUT_MS = 15000
+WIZARD_TIMEOUT_MS = 30000
 
 SELECTORS = {
     "login_username": "input[autocomplete='username']",
@@ -365,10 +366,10 @@ def ensure_calendar_month(page, target_date):
         page.wait_for_timeout(250)
 
     target = datetime.strptime(target_date, "%Y-%m-%d").date()
-    period = page.locator(".mat-calendar-period-button").first
     next_btn = page.locator("button.mat-calendar-next-button, button[aria-label='Next month']")
     prev_btn = page.locator("button.mat-calendar-previous-button, button[aria-label='Previous month']")
     for _ in range(24):
+        period = must_locator(page, ".mat-calendar-period-button", "calendar_period_button", DEFAULT_TIMEOUT_MS).first
         current_text = period.inner_text().strip()
         current_year, current_month = parse_calendar_period(current_text)
         if (current_year, current_month) == (target.year, target.month):
@@ -378,6 +379,26 @@ def ensure_calendar_month(page, target_date):
         else:
             click_calendar_button(prev_btn, "button.mat-calendar-previous-button, button[aria-label='Previous month']")
     raise RuntimeError("Unable to navigate calendar to target month")
+
+
+def wait_for_booking_wizard(page, timeout_ms=WIZARD_TIMEOUT_MS):
+    """
+    After selecting a hut and clicking OK from the reservation list modal, the UI
+    should navigate into the booking wizard (e.g. /reservation/book-hut/.../wizard).
+    Without this wait, we can accidentally interact with the reservation list filters
+    (which also include date pickers) and get inconsistent results.
+    """
+    deadline = time.time() + (timeout_ms / 1000)
+    while time.time() < deadline:
+        url = page.url or ""
+        if "/reservation/book-hut/" in url and "/wizard" in url:
+            return
+        if page.locator(SELECTORS["next_check_availability"]).count() > 0:
+            return
+        if page.locator("text=/Controlla disponibilit[aà]/i").count() > 0:
+            return
+        page.wait_for_timeout(250)
+    raise RuntimeError(f"Did not reach booking wizard after hut selection. Current URL: {page.url}")
 
 
 def choose_hut_option(page, hut_name):
@@ -423,11 +444,16 @@ def select_date_range(page, check_in, check_out):
     except PlaywrightTimeoutError:
         toggle.first.click(force=True)
 
-    if not wait_for_visible(page, ".mat-calendar-period-button", timeout_ms=3000):
+    if not wait_for_visible(page, ".mat-calendar-period-button", timeout_ms=2500):
         date_input = page.locator("input[placeholder*='Data'], input[aria-label*='Data']")
         if date_input.count() > 0:
-            date_input.first.click()
-        page.wait_for_selector(".mat-calendar, .mat-datepicker-content", timeout=DEFAULT_TIMEOUT_MS)
+            try:
+                date_input.first.click(timeout=DEFAULT_TIMEOUT_MS)
+            except Exception:
+                date_input.first.click(force=True)
+        if not wait_for_visible(page, ".mat-calendar-period-button", timeout_ms=2500):
+            page.wait_for_selector(".mat-calendar, .mat-datepicker-content", timeout=DEFAULT_TIMEOUT_MS)
+            must_locator(page, ".mat-calendar-period-button", "calendar_period_button", DEFAULT_TIMEOUT_MS)
     for date_str in [check_in, check_out]:
         ensure_calendar_month(page, date_str)
         ui_date = format_date_for_ui(date_str)
@@ -692,7 +718,7 @@ def overnight_form_visible(page):
     return any(page.locator(selector).count() > 0 for selector in OVERNIGHT_FORM_SELECTORS)
 
 
-def wait_for_overnight_form_visible(page, timeout_ms=9000):
+def wait_for_overnight_form_visible(page, timeout_ms=20000):
     deadline = time.time() + (timeout_ms / 1000)
     while time.time() < deadline:
         if overnight_form_visible(page):
@@ -701,7 +727,7 @@ def wait_for_overnight_form_visible(page, timeout_ms=9000):
     return False
 
 
-def wait_for_overnight_form(page, timeout_ms=9000):
+def wait_for_overnight_form(page, timeout_ms=20000):
     if not wait_for_overnight_form_visible(page, timeout_ms=timeout_ms):
         raise RuntimeError("Overnight stay form did not load in time")
 
@@ -979,6 +1005,8 @@ def run_attempt(config, username, password, args, attempt_index=1):
         chosen_hut = choose_hut_option(page, config["hut_name"])
         must_locator(page, SELECTORS["add_reservation_ok"], "add_reservation_ok", DEFAULT_TIMEOUT_MS).first.click()
         step = snap(page, screenshot_dir, step, f"hut_selected_{chosen_hut.replace(' ', '_')}")
+        wait_for_booking_wizard(page, timeout_ms=WIZARD_TIMEOUT_MS)
+        step = snap(page, screenshot_dir, step, "wizard_loaded")
 
         select_date_range(page, config["check_in"], config["check_out"])
         step = snap(page, screenshot_dir, step, "dates_selected")
