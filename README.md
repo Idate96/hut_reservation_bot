@@ -36,6 +36,17 @@ python book.py --config config_konkordia_2026-04-03.yaml --poll --interval-secon
 ```
 Use `--max-attempts N` to stop after N checks. Polling retries only when dates are unavailable; any other error stops immediately. Enable `allow_waitlist` if you want to continue even when full.
 
+## Multi-config (round-robin)
+```
+python book.py \
+  --config config_konkordia_2026-04-03.yaml \
+  --config config_finsteraarhorn_2026-04-03_05.yaml \
+  --config config_oberaarjoch_2026-04-05.yaml \
+  --poll --interval-seconds 300 --jitter-seconds 30
+```
+With multiple configs, the bot cycles through each one per interval. If you omit `--poll`, it runs once per config.  
+When multiple configs have polling enabled, their `poll_*` settings must match unless you pass `--poll`.
+
 ## Notes
 - The current selectors target the Italian UI (placeholders/labels like `Di cui bambini`, `Vegetariani`).
 - SAC login redirects to `portal.sac-cas.ch`; selectors may change over time.

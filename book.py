@@ -48,7 +48,7 @@ ROOM_TYPE_KEYWORDS = {
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", required=True)
+    parser.add_argument("--config", required=True, action="append")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--screenshot-dir", default="screens")
     parser.add_argument("--headless", action="store_true")
@@ -58,8 +58,14 @@ def parse_args():
     parser.add_argument("--poll", action="store_true")
     parser.add_argument("--interval-seconds", type=int, default=300)
     parser.add_argument("--max-attempts", type=int, default=0)
-    parser.add_argument("--jitter-seconds", type=int, default=30)
+    parser.add_argument("--jitter-seconds", type=int, default=0)
     return parser.parse_args()
+
+
+def clone_args(args, **overrides):
+    data = vars(args).copy()
+    data.update(overrides)
+    return argparse.Namespace(**data)
 
 
 def require_str(data, key, context):
@@ -181,9 +187,12 @@ def load_config(path):
     half_board = require_bool(data, "half_board", "config")
     allow_alternative_dates = optional_bool(data, "allow_alternative_dates", default=False)
     allow_waitlist = optional_bool(data, "allow_waitlist", default=False)
-    auto_poll_if_full = optional_bool(data, "auto_poll_if_full", default=False)
+    if "auto_poll_if_full" in data:
+        auto_poll_if_full = optional_bool(data, "auto_poll_if_full", default=False)
+    else:
+        auto_poll_if_full = not allow_waitlist
     poll_interval_seconds = optional_positive_int(data, "poll_interval_seconds", 300)
-    poll_jitter_seconds = optional_int(data, "poll_jitter_seconds", 30)
+    poll_jitter_seconds = optional_int(data, "poll_jitter_seconds", 0)
     poll_max_attempts = optional_int(data, "poll_max_attempts", 0)
     if poll_jitter_seconds < 0:
         raise ValueError("config.poll_jitter_seconds must be >= 0")
@@ -487,6 +496,22 @@ def choose_people_input(page, room_type):
     raise RuntimeError("Multiple people inputs available; set preferences.room_type")
 
 
+def fill_input_or_validate(locator, value, field_name):
+    if locator is None:
+        return
+    try:
+        locator.scroll_into_view_if_needed()
+    except Exception:
+        pass
+    if locator.is_enabled():
+        locator.click()
+        locator.fill(str(value))
+        return
+    current = (locator.input_value() or "").strip()
+    if str(value) not in current:
+        raise RuntimeError(f"Field '{field_name}' is disabled and does not match value '{value}'")
+
+
 def fill_by_placeholder(page, placeholder, value):
     if value is None:
         return
@@ -498,6 +523,12 @@ def fill_by_placeholder(page, placeholder, value):
 
 def normalize_text(value):
     return re.sub(r"\s+", " ", value or "").strip().lower()
+
+
+def slugify(value):
+    normalized = normalize_text(value)
+    normalized = re.sub(r"[^a-z0-9]+", "_", normalized)
+    return normalized.strip("_")
 
 
 def label_matches(text, labels):
@@ -564,6 +595,27 @@ def find_input_by_labels(page, labels):
     return None
 
 
+PEOPLE_TOTAL_LABELS = [
+    "Num. di persone",
+    "Numero di persone",
+    "Number of people",
+    "Persone",
+    "Persons",
+]
+
+
+def find_total_people_input(page):
+    return find_input_by_labels(page, PEOPLE_TOTAL_LABELS)
+
+
+def set_party_size_inputs(page, party_size, room_type):
+    room_input = choose_people_input(page, room_type)
+    fill_input_or_validate(room_input, party_size, "room_type_people")
+    total_input = find_total_people_input(page)
+    fill_input_or_validate(total_input, party_size, "total_people")
+    return room_input
+
+
 def fill_by_labels(page, labels, value, field_name):
     if value is None:
         return
@@ -622,21 +674,33 @@ def select_half_board(page, half_board):
     radio.click()
 
 
-def wait_for_overnight_form(page):
-    selectors = [
-        "mat-radio-button",
-        "input[placeholder='Di cui bambini']",
-        "input[placeholder='Di cui guide alpine']",
-        "input[placeholder='Vegetariani']",
-        "input[placeholder='Pacchetto lunch']",
-        "input[placeholder='Nome di gruppo']",
-        "input[placeholder='Allergie e intolleranze']",
-    ]
-    for _ in range(30):
-        if any(page.locator(selector).count() > 0 for selector in selectors):
-            return
+OVERNIGHT_FORM_SELECTORS = [
+    "mat-radio-button",
+    "input[placeholder='Di cui bambini']",
+    "input[placeholder='Di cui guide alpine']",
+    "input[placeholder='Vegetariani']",
+    "input[placeholder='Pacchetto lunch']",
+    "input[placeholder='Nome di gruppo']",
+    "input[placeholder='Allergie e intolleranze']",
+]
+
+
+def overnight_form_visible(page):
+    return any(page.locator(selector).count() > 0 for selector in OVERNIGHT_FORM_SELECTORS)
+
+
+def wait_for_overnight_form_visible(page, timeout_ms=9000):
+    deadline = time.time() + (timeout_ms / 1000)
+    while time.time() < deadline:
+        if overnight_form_visible(page):
+            return True
         page.wait_for_timeout(300)
-    raise RuntimeError("Overnight stay form did not load in time")
+    return False
+
+
+def wait_for_overnight_form(page, timeout_ms=9000):
+    if not wait_for_overnight_form_visible(page, timeout_ms=timeout_ms):
+        raise RuntimeError("Overnight stay form did not load in time")
 
 
 def fill_personal_value(page, label_text, value):
@@ -727,6 +791,13 @@ def find_next_availability_button(page):
     ]
     for selector in candidates:
         locator = page.locator(selector)
+        for idx in range(locator.count()):
+            candidate = locator.nth(idx)
+            try:
+                if candidate.is_visible() and not candidate.is_disabled():
+                    return candidate
+            except Exception:
+                continue
         if locator.count() > 0:
             return locator.first
     raise RuntimeError("Next availability button not found")
@@ -740,32 +811,113 @@ def find_availability_continue_button(page):
     ]
     for selector in candidates:
         locator = page.locator(selector)
+        for idx in range(locator.count()):
+            candidate = locator.nth(idx)
+            try:
+                if candidate.is_visible() and not candidate.is_disabled():
+                    return candidate
+            except Exception:
+                continue
         if locator.count() > 0:
             return locator.first
     return None
 
 
+def availability_advanced(page, timeout_ms=8000):
+    if wait_for_visible(page, SELECTORS["next_overnight"], timeout_ms=min(1500, timeout_ms)):
+        return True
+    if wait_for_visible(page, "text=/Pernottamento/i", timeout_ms=min(1500, timeout_ms)):
+        return True
+    return wait_for_overnight_form_visible(page, timeout_ms=timeout_ms)
+
+
 def enable_waitlist_if_present(page):
-    candidates = [
-        "mat-checkbox:has-text('lista d\\'attesa')",
-        "mat-checkbox:has-text('lista di attesa')",
-        "mat-checkbox:has-text('waiting list')",
+    waitlist_text = page.locator("text=/lista d[' ]?attesa/i, text=/waiting list/i")
+    if waitlist_text.count() == 0:
+        return False
+
+    try:
+        waitlist_text.first.scroll_into_view_if_needed()
+    except Exception:
+        pass
+    try:
+        page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+    except Exception:
+        pass
+
+    try:
+        role_box = page.get_by_role("checkbox", name=re.compile("lista d'attesa|waiting list", re.I))
+        if role_box.count() > 0:
+            role_box.first.scroll_into_view_if_needed()
+            role_box.first.check(force=True)
+            return True
+    except Exception:
+        pass
+
+    label_candidates = [
         "label:has-text('lista d\\'attesa')",
         "label:has-text('lista di attesa')",
         "label:has-text('waiting list')",
     ]
-    for selector in candidates:
+    for selector in label_candidates:
         locator = page.locator(selector)
         if locator.count() == 0:
             continue
-        target = locator.first
         try:
-            if target.get_attribute("aria-checked") != "true":
-                target.click()
+            locator.first.scroll_into_view_if_needed()
         except Exception:
-            target.click()
-        return True
-    return False
+            pass
+        try:
+            locator.first.click(force=True)
+            return True
+        except Exception:
+            continue
+
+    mat_checkbox = page.locator(
+        "mat-checkbox:has-text('lista d\\'attesa'), mat-checkbox:has-text('lista di attesa'), mat-checkbox:has-text('waiting list')"
+    )
+    if mat_checkbox.count() > 0:
+        try:
+            mat_checkbox.first.scroll_into_view_if_needed()
+        except Exception:
+            pass
+        try:
+            mat_checkbox.first.click(force=True)
+            return True
+        except Exception:
+            pass
+
+    try:
+        js_clicked = page.evaluate(
+            """
+            () => {
+                const matcher = /lista d[' ]?attesa|waiting list/i;
+                const all = Array.from(document.querySelectorAll("body *"));
+                const textEl = all.find((el) => matcher.test(el.textContent || ""));
+                if (!textEl) return false;
+
+                const label = textEl.closest("label") || textEl.querySelector("label");
+                const forId = label ? label.getAttribute("for") : null;
+                const labelInput = label ? label.querySelector("input[type='checkbox']") : null;
+                const forInput = forId ? document.getElementById(forId) : null;
+                const matInput = textEl.closest("mat-checkbox")?.querySelector("input[type='checkbox']");
+                const nearby =
+                    textEl.closest("div, section, form, mat-dialog-container")?.querySelector("input[type='checkbox']");
+                const input = labelInput || forInput || matInput || nearby || document.querySelector("input[type='checkbox']");
+                if (!input) return false;
+
+                const target = label || input.closest("mat-checkbox") || input;
+                if (target) target.click();
+                input.checked = true;
+                input.dispatchEvent(new Event("input", { bubbles: true }));
+                input.dispatchEvent(new Event("change", { bubbles: true }));
+                return input.checked || input.getAttribute("aria-checked") === "true";
+            }
+            """
+        )
+        return bool(js_clicked)
+    except Exception:
+        return False
 
 
 def find_summary_submit_button(page):
@@ -828,8 +980,7 @@ def run_attempt(config, username, password, args, attempt_index=1):
         select_date_range(page, config["check_in"], config["check_out"])
         step = snap(page, screenshot_dir, step, "dates_selected")
 
-        people_input = choose_people_input(page, config["preferences"].get("room_type"))
-        people_input.fill(str(config["party_size"]))
+        set_party_size_inputs(page, config["party_size"], config["preferences"].get("room_type"))
         page.keyboard.press("Tab")
         step = snap(page, screenshot_dir, step, "people_set")
 
@@ -840,14 +991,14 @@ def run_attempt(config, username, password, args, attempt_index=1):
         except PlaywrightTimeoutError:
             next_check.click(force=True)
 
-        if not wait_for_visible(page, SELECTORS["next_overnight"], timeout_ms=3000):
+        if not availability_advanced(page, timeout_ms=8000):
             continue_button = find_availability_continue_button(page)
             if continue_button is not None:
                 continue_button.scroll_into_view_if_needed()
                 continue_button.click()
                 page.wait_for_timeout(500)
 
-        if not wait_for_visible(page, SELECTORS["next_overnight"], timeout_ms=3000):
+        if not availability_advanced(page, timeout_ms=8000):
             if config["allow_waitlist"]:
                 waitlist_enabled = enable_waitlist_if_present(page)
                 if not waitlist_enabled:
@@ -865,7 +1016,7 @@ def run_attempt(config, username, password, args, attempt_index=1):
                     "Requested dates not available. Set allow_alternative_dates or allow_waitlist to continue."
                 )
 
-        if not wait_for_visible(page, SELECTORS["next_overnight"], timeout_ms=3000):
+        if not availability_advanced(page, timeout_ms=8000):
             raise AvailabilityNotFoundError("Availability flow did not advance to overnight step.")
         step = snap(page, screenshot_dir, step, "availability_checked")
 
@@ -930,37 +1081,114 @@ def run_attempt(config, username, password, args, attempt_index=1):
         browser.close()
 
 
+def config_label(config):
+    return f"{config['hut_name']} {config['check_in']} -> {config['check_out']}"
+
+
+def config_tag(config):
+    return slugify(f"{config['hut_name']}_{config['check_in']}_{config['check_out']}")
+
+
+def resolve_poll_settings(configs, poll_flags, args):
+    if args.poll:
+        return args.interval_seconds, args.jitter_seconds, args.max_attempts
+    intervals = {cfg["poll_interval_seconds"] for cfg, flag in zip(configs, poll_flags) if flag}
+    jitters = {cfg["poll_jitter_seconds"] for cfg, flag in zip(configs, poll_flags) if flag}
+    max_attempts_set = {cfg["poll_max_attempts"] for cfg, flag in zip(configs, poll_flags) if flag}
+    if not intervals:
+        return None
+    if len(intervals) > 1 or len(jitters) > 1 or len(max_attempts_set) > 1:
+        raise ValueError(
+            "Multiple configs with polling require matching poll_* settings or pass --poll with global settings."
+        )
+    return intervals.pop(), jitters.pop(), max_attempts_set.pop()
+
+
 def main():
     args = parse_args()
-    config = load_config(args.config)
+    configs = [load_config(path) for path in args.config]
     username, password = load_credentials()
 
-    poll_enabled = args.poll or config["auto_poll_if_full"]
-    if poll_enabled:
-        interval_seconds = args.interval_seconds if args.poll else config["poll_interval_seconds"]
-        jitter_seconds = args.jitter_seconds if args.poll else config["poll_jitter_seconds"]
-        max_attempts = args.max_attempts if args.poll else config["poll_max_attempts"]
-        if interval_seconds <= 0:
-            raise ValueError("interval_seconds must be > 0")
-        if jitter_seconds < 0:
-            raise ValueError("jitter_seconds must be >= 0")
-        if max_attempts < 0:
-            raise ValueError("max_attempts must be >= 0")
-        attempt = 0
-        while True:
-            attempt += 1
-            try:
-                run_attempt(config, username, password, args, attempt_index=attempt)
-                print("Booking flow completed.")
-                return
-            except AvailabilityNotFoundError as exc:
-                if max_attempts and attempt >= max_attempts:
-                    raise
-                wait_time = interval_seconds + (random.randint(0, jitter_seconds) if jitter_seconds else 0)
-                print(f"Attempt {attempt}: {exc}. Retrying in {wait_time}s.")
-                time.sleep(wait_time)
+    poll_flags = [args.poll or cfg["auto_poll_if_full"] for cfg in configs]
+    poll_settings = resolve_poll_settings(configs, poll_flags, args)
+    poll_enabled = bool(poll_settings)
+
+    args_per_config = []
+    if args.screenshot_dir and len(configs) > 1:
+        base_dir = Path(args.screenshot_dir)
+        for cfg in configs:
+            cfg_dir = base_dir / config_tag(cfg)
+            args_per_config.append(clone_args(args, screenshot_dir=str(cfg_dir)))
     else:
-        run_attempt(config, username, password, args, attempt_index=1)
+        args_per_config = [args for _ in configs]
+
+    if len(configs) == 1:
+        config = configs[0]
+        config_args = args_per_config[0]
+        if poll_enabled:
+            interval_seconds, jitter_seconds, max_attempts = poll_settings
+            if interval_seconds <= 0:
+                raise ValueError("interval_seconds must be > 0")
+            if jitter_seconds < 0:
+                raise ValueError("jitter_seconds must be >= 0")
+            if max_attempts < 0:
+                raise ValueError("max_attempts must be >= 0")
+            attempt = 0
+            while True:
+                attempt += 1
+                try:
+                    run_attempt(config, username, password, config_args, attempt_index=attempt)
+                    print("Booking flow completed.")
+                    return
+                except AvailabilityNotFoundError as exc:
+                    if max_attempts and attempt >= max_attempts:
+                        raise
+                    wait_time = interval_seconds + (random.randint(0, jitter_seconds) if jitter_seconds else 0)
+                    print(f"Attempt {attempt}: {exc}. Retrying in {wait_time}s.")
+                    time.sleep(wait_time)
+        else:
+            run_attempt(config, username, password, config_args, attempt_index=1)
+        return
+
+    if not poll_enabled:
+        for cfg, cfg_args in zip(configs, args_per_config):
+            run_attempt(cfg, username, password, cfg_args, attempt_index=1)
+        return
+
+    interval_seconds, jitter_seconds, max_attempts = poll_settings
+    if interval_seconds <= 0:
+        raise ValueError("interval_seconds must be > 0")
+    if jitter_seconds < 0:
+        raise ValueError("jitter_seconds must be >= 0")
+    if max_attempts < 0:
+        raise ValueError("max_attempts must be >= 0")
+
+    pending = []
+    attempt_counts = [0 for _ in configs]
+    for idx, flag in enumerate(poll_flags):
+        if flag:
+            pending.append(idx)
+        else:
+            run_attempt(configs[idx], username, password, args_per_config[idx], attempt_index=1)
+
+    cycle = 0
+    while pending:
+        cycle += 1
+        for idx in list(pending):
+            attempt_counts[idx] += 1
+            try:
+                run_attempt(configs[idx], username, password, args_per_config[idx], attempt_index=attempt_counts[idx])
+                print(f"Booking flow completed for {config_label(configs[idx])}.")
+                pending.remove(idx)
+            except AvailabilityNotFoundError as exc:
+                if max_attempts and cycle >= max_attempts:
+                    raise
+                print(f"{config_label(configs[idx])}: {exc}")
+        if not pending:
+            return
+        wait_time = interval_seconds + (random.randint(0, jitter_seconds) if jitter_seconds else 0)
+        print(f"Pending {len(pending)} configs. Retrying in {wait_time}s.")
+        time.sleep(wait_time)
 
 
 if __name__ == "__main__":
