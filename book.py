@@ -554,6 +554,65 @@ def normalize_text(value):
     return re.sub(r"\s+", " ", value or "").strip().lower()
 
 
+def scroll_all_scrollables(page, direction="bottom", passes=6, pause_ms=200):
+    """
+    hut-reservation.org uses nested scroll containers (Angular Material). Playwright's
+    full-page screenshot and document scroll often do not touch these, and some UI
+    sections (like the waiting-list checkbox) only appear after scrolling.
+    """
+    js = """
+    (direction) => {
+        const nodes = [];
+        const add = (el) => { if (el && !nodes.includes(el)) nodes.push(el); };
+
+        add(document.scrollingElement);
+        add(document.documentElement);
+        add(document.body);
+
+        const common = [
+            ".mat-drawer-content",
+            "mat-sidenav-content",
+            ".mat-dialog-content",
+            ".cdk-virtual-scroll-viewport",
+            "main",
+        ];
+        for (const sel of common) {
+            for (const el of Array.from(document.querySelectorAll(sel))) add(el);
+        }
+
+        const all = Array.from(document.querySelectorAll("body *"));
+        for (const el of all) {
+            try {
+                const style = window.getComputedStyle(el);
+                if (!style) continue;
+                if (!["auto", "scroll"].includes(style.overflowY)) continue;
+                if (el.scrollHeight <= el.clientHeight + 50) continue;
+                add(el);
+            } catch (e) {}
+        }
+
+        let changed = false;
+        for (const el of nodes) {
+            if (!el) continue;
+            const before = el.scrollTop;
+            if (direction === "bottom") el.scrollTop = el.scrollHeight;
+            else if (direction === "top") el.scrollTop = 0;
+            else if (typeof direction === "number") el.scrollTop = before + direction;
+            if (el.scrollTop !== before) changed = true;
+        }
+        return changed;
+    }
+    """
+    for _ in range(max(1, int(passes))):
+        try:
+            changed = bool(page.evaluate(js, direction))
+        except Exception:
+            changed = False
+        page.wait_for_timeout(pause_ms)
+        if not changed:
+            break
+
+
 def slugify(value):
     normalized = normalize_text(value)
     normalized = re.sub(r"[^a-z0-9]+", "_", normalized)
@@ -649,6 +708,14 @@ def ensure_expected_date_range(page, check_in, check_out, allow_alternative_date
     expected = f"{expected_start} - {expected_end}"
 
     dates, raw = read_date_range_ui_dates(page)
+    if len(dates) < 2:
+        deadline = time.time() + 3.0
+        while time.time() < deadline:
+            page.wait_for_timeout(200)
+            dates2, raw2 = read_date_range_ui_dates(page)
+            if len(dates2) >= 2:
+                dates, raw = dates2, raw2
+                break
     if len(dates) >= 2 and dates[0] == expected_start and dates[1] == expected_end:
         return
     if len(dates) == 1 and dates[0] == expected_start:
@@ -662,7 +729,11 @@ def ensure_expected_date_range(page, check_in, check_out, allow_alternative_date
         return
 
     select_date_range(page, check_in, check_out)
+    deadline = time.time() + 3.0
     dates, raw = read_date_range_ui_dates(page)
+    while len(dates) < 2 and time.time() < deadline:
+        page.wait_for_timeout(200)
+        dates, raw = read_date_range_ui_dates(page)
     if not (len(dates) >= 2 and dates[0] == expected_start and dates[1] == expected_end):
         raise RuntimeError(f"Date range changed unexpectedly. Expected '{expected}', got '{raw}'.")
 
@@ -1009,8 +1080,9 @@ def availability_advanced(page, timeout_ms=8000):
 
 def enable_waitlist_if_present(page):
     waitlist_text = page.locator("text=/lista d['\\u2019 ]?attesa/i, text=/waiting list/i")
-    deadline = time.time() + 6.0
+    deadline = time.time() + 8.0
     while time.time() < deadline and waitlist_text.count() == 0:
+        scroll_all_scrollables(page, direction="bottom", passes=2, pause_ms=150)
         page.wait_for_timeout(250)
     if waitlist_text.count() == 0:
         return False
@@ -1198,12 +1270,15 @@ def run_attempt(config, username, password, args, attempt_index=1):
 
         next_check = find_availability_next_button(page)
         if next_check.is_disabled() and config["allow_waitlist"]:
+            scroll_all_scrollables(page, direction="bottom", passes=6, pause_ms=150)
+            step = snap(page, screenshot_dir, step, "availability_scrolled_for_waitlist")
             ensure_expected_date_range(page, config["check_in"], config["check_out"], allow_alternative_dates=False)
             enabled = enable_waitlist_if_present(page)
             if enabled:
                 page.wait_for_timeout(300)
                 next_check = find_availability_next_button(page)
         if next_check.is_disabled():
+            step = snap(page, screenshot_dir, step, "availability_next_still_disabled")
             raise AvailabilityNotFoundError("Availability step cannot continue (button disabled).")
         try:
             next_check.click(timeout=DEFAULT_TIMEOUT_MS)
@@ -1213,12 +1288,15 @@ def run_attempt(config, username, password, args, attempt_index=1):
         if not availability_advanced(page, timeout_ms=8000):
             continue_button = find_availability_next_button(page)
             if continue_button.is_disabled() and config["allow_waitlist"]:
+                scroll_all_scrollables(page, direction="bottom", passes=6, pause_ms=150)
+                step = snap(page, screenshot_dir, step, "availability_continue_scrolled_for_waitlist")
                 ensure_expected_date_range(page, config["check_in"], config["check_out"], allow_alternative_dates=False)
                 enabled = enable_waitlist_if_present(page)
                 if enabled:
                     page.wait_for_timeout(300)
                     continue_button = find_availability_next_button(page)
             if continue_button.is_disabled():
+                step = snap(page, screenshot_dir, step, "availability_continue_still_disabled")
                 raise AvailabilityNotFoundError("Availability step cannot continue (button disabled).")
             continue_button.click()
             page.wait_for_timeout(800)
