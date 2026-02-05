@@ -864,7 +864,10 @@ def availability_advanced(page, timeout_ms=8000):
 
 
 def enable_waitlist_if_present(page):
-    waitlist_text = page.locator("text=/lista d[' ]?attesa/i, text=/waiting list/i")
+    waitlist_text = page.locator("text=/lista d['\\u2019 ]?attesa/i, text=/waiting list/i")
+    deadline = time.time() + 6.0
+    while time.time() < deadline and waitlist_text.count() == 0:
+        page.wait_for_timeout(250)
     if waitlist_text.count() == 0:
         return False
 
@@ -873,12 +876,28 @@ def enable_waitlist_if_present(page):
     except Exception:
         pass
     try:
-        page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        page.evaluate(
+            """
+            () => {
+                const targets = [
+                    document.scrollingElement,
+                    document.querySelector(".mat-drawer-content"),
+                    document.querySelector("mat-sidenav-content"),
+                    document.querySelector("main"),
+                    document.body,
+                    document.documentElement,
+                ].filter(Boolean);
+                for (const el of targets) {
+                    try { el.scrollTo(0, el.scrollHeight); } catch (e) {}
+                }
+            }
+            """
+        )
     except Exception:
         pass
 
     try:
-        role_box = page.get_by_role("checkbox", name=re.compile("lista d'attesa|waiting list", re.I))
+        role_box = page.get_by_role("checkbox", name=re.compile("lista d['\u2019 ]?attesa|waiting list", re.I))
         if role_box.count() > 0:
             role_box.first.scroll_into_view_if_needed()
             role_box.first.check(force=True)
@@ -923,7 +942,7 @@ def enable_waitlist_if_present(page):
         js_clicked = page.evaluate(
             """
             () => {
-                const matcher = /lista d[' ]?attesa|waiting list/i;
+                const matcher = /lista d['\\u2019 ]?attesa|waiting list/i;
                 const all = Array.from(document.querySelectorAll("body *"));
                 const textEl = all.find((el) => matcher.test(el.textContent || ""));
                 if (!textEl) return false;
@@ -1042,6 +1061,7 @@ def run_attempt(config, username, password, args, attempt_index=1):
             if config["allow_waitlist"]:
                 waitlist_enabled = enable_waitlist_if_present(page)
                 if not waitlist_enabled:
+                    step = snap(page, screenshot_dir, step, "waitlist_not_found")
                     raise AvailabilityNotFoundError(
                         "Requested dates not available and no waiting list option was offered."
                     )
