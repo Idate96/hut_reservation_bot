@@ -1079,119 +1079,87 @@ def availability_advanced(page, timeout_ms=8000):
 
 
 def enable_waitlist_if_present(page):
-    waitlist_text = page.locator("text=/lista d['\\u2019 ]?attesa/i, text=/waiting list/i")
+    scroll_all_scrollables(page, direction="bottom", passes=8, pause_ms=150)
+
+    waitlist_line = page.locator("text=/Continua\\s+e\\s+sarai\\s+messo\\s+in\\s+lista\\s+d['\\u2019 ]?attesa/i")
     deadline = time.time() + 8.0
-    while time.time() < deadline and waitlist_text.count() == 0:
-        scroll_all_scrollables(page, direction="bottom", passes=2, pause_ms=150)
+    while time.time() < deadline and waitlist_line.count() == 0:
         page.wait_for_timeout(250)
-    if waitlist_text.count() == 0:
+        scroll_all_scrollables(page, direction="bottom", passes=2, pause_ms=150)
+    if waitlist_line.count() == 0:
         return False
 
-    waitlist_container = waitlist_text.first.locator(
-        "xpath=ancestor-or-self::*[self::form or self::section or self::div or self::mat-dialog-container][1]"
-    )
-
+    target = waitlist_line.first
     try:
-        waitlist_text.first.scroll_into_view_if_needed()
-    except Exception:
-        pass
-    try:
-        page.evaluate(
-            """
-            () => {
-                const targets = [
-                    document.scrollingElement,
-                    document.querySelector(".mat-drawer-content"),
-                    document.querySelector("mat-sidenav-content"),
-                    document.querySelector("main"),
-                    document.body,
-                    document.documentElement,
-                ].filter(Boolean);
-                for (const el of targets) {
-                    try { el.scrollTo(0, el.scrollHeight); } catch (e) {}
-                }
-            }
-            """
-        )
+        target.scroll_into_view_if_needed()
     except Exception:
         pass
 
+    # Clicking the text itself often toggles the checkbox (label-bound inputs).
     try:
-        role_box = page.get_by_role("checkbox", name=re.compile("lista d['\u2019 ]?attesa|waiting list", re.I))
-        if role_box.count() > 0:
-            role_box.first.scroll_into_view_if_needed()
-            role_box.first.check(force=True)
-            return True
+        target.click(force=True)
+        page.wait_for_timeout(200)
     except Exception:
         pass
 
-    label_candidates = [
-        "label:has-text('lista d\\'attesa')",
-        "label:has-text('lista di attesa')",
-        "label:has-text('waiting list')",
+    checkbox_candidates = [
+        target.locator("xpath=ancestor-or-self::label[1]//input[@type='checkbox']"),
+        target.locator("xpath=ancestor-or-self::div[1]//input[@type='checkbox']"),
+        target.locator("xpath=ancestor-or-self::div[2]//input[@type='checkbox']"),
+        target.locator("xpath=preceding::input[@type='checkbox'][1]"),
+        target.locator("xpath=following::input[@type='checkbox'][1]"),
     ]
-    for selector in label_candidates:
-        locator = page.locator(selector)
-        if locator.count() == 0:
+    for cb in checkbox_candidates:
+        if cb.count() == 0:
             continue
+        box = cb.first
         try:
-            locator.first.scroll_into_view_if_needed()
+            box.check(force=True)
         except Exception:
-            pass
+            try:
+                box.click(force=True)
+            except Exception:
+                continue
         try:
-            locator.first.click(force=True)
-            return True
-        except Exception:
-            continue
-
-    mat_checkbox = page.locator(
-        "mat-checkbox:has-text('lista d\\'attesa'), mat-checkbox:has-text('lista di attesa'), mat-checkbox:has-text('waiting list')"
-    )
-    if mat_checkbox.count() > 0:
-        try:
-            mat_checkbox.first.scroll_into_view_if_needed()
-        except Exception:
-            pass
-        try:
-            mat_checkbox.first.click(force=True)
-            return True
-        except Exception:
-            pass
-
-    try:
-        if waitlist_container.count() > 0:
-            local_box = waitlist_container.first.locator("input[type='checkbox'], mat-checkbox")
-            if local_box.count() > 0:
-                local_box.first.click(force=True)
+            if box.is_checked():
                 return True
-    except Exception:
-        pass
+        except Exception:
+            pass
 
     try:
         js_clicked = page.evaluate(
             """
             () => {
-                const matcher = /lista d['\\u2019 ]?attesa|waiting list/i;
-                const all = Array.from(document.querySelectorAll("body *"));
-                const textEl = all.find((el) => matcher.test(el.textContent || ""));
-                if (!textEl) return false;
+                const lineMatcher = /Continua\\s+e\\s+sarai\\s+messo\\s+in\\s+lista\\s+d['\\u2019 ]?attesa/i;
+                const textNodes = Array.from(document.querySelectorAll("body *"));
+                const el = textNodes.find((node) => lineMatcher.test((node.textContent || "").trim()));
+                if (!el) return false;
 
-                const label = textEl.closest("label") || textEl.querySelector("label");
-                const forId = label ? label.getAttribute("for") : null;
-                const labelInput = label ? label.querySelector("input[type='checkbox']") : null;
-                const forInput = forId ? document.getElementById(forId) : null;
-                const matInput = textEl.closest("mat-checkbox")?.querySelector("input[type='checkbox']");
-                const nearby =
-                    textEl.closest("div, section, form, mat-dialog-container")?.querySelector("input[type='checkbox']");
-                const input = labelInput || forInput || matInput || nearby || document.querySelector("input[type='checkbox']");
-                if (!input) return false;
+                const visible = (node) => {
+                    if (!node) return false;
+                    const r = node.getBoundingClientRect();
+                    if (!r || r.width <= 0 || r.height <= 0) return false;
+                    const s = window.getComputedStyle(node);
+                    if (!s) return false;
+                    if (s.visibility === "hidden" || s.display === "none") return false;
+                    return true;
+                };
 
-                const target = label || input.closest("mat-checkbox") || input;
-                if (target) target.click();
-                input.checked = true;
-                input.dispatchEvent(new Event("input", { bubbles: true }));
-                input.dispatchEvent(new Event("change", { bubbles: true }));
-                return input.checked || input.getAttribute("aria-checked") === "true";
+                const root = el.closest("label") || el.closest("div") || el;
+                const boxes = Array.from(root.querySelectorAll("input[type='checkbox']")).filter(visible);
+                if (boxes.length === 0) {
+                    const near = el.closest("div, section, form") || document.body;
+                    const nearBoxes = Array.from(near.querySelectorAll("input[type='checkbox']")).filter(visible);
+                    if (nearBoxes.length === 0) return false;
+                    boxes.push(...nearBoxes);
+                }
+
+                const box = boxes[0];
+                try { box.click(); } catch (e) {}
+                box.checked = true;
+                box.dispatchEvent(new Event("input", { bubbles: true }));
+                box.dispatchEvent(new Event("change", { bubbles: true }));
+                return !!box.checked;
             }
             """
         )
