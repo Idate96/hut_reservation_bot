@@ -1,6 +1,9 @@
 .env
 config.yaml
 config_*.yaml
+.alert_state/
+logs/
+.gmail_web_profile/
 screens/
 __pycache__/
 .pytest_cache/

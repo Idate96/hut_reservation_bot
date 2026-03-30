@@ -10,6 +10,11 @@ auto_poll_if_full: false
 poll_interval_seconds: 300
 poll_jitter_seconds: 30
 poll_max_attempts: 0
+alert:
+  to:
+    - "ada@example.com"
+  command: ".venv/bin/python send_alert_email.py"
+  any_night: false
 children_count: 0
 guides_count: 0
 vegetarian_count: 0

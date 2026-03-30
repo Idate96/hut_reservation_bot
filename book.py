@@ -1,11 +1,14 @@
 import argparse
+import json
 import os
 import random
 import re
+import subprocess
 import sys
 import time
 import unicodedata
-from datetime import datetime
+from copy import deepcopy
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import yaml
@@ -27,7 +30,7 @@ SELECTORS = {
     "sac_username": "input#person_login_identity",
     "sac_password": "input#person_password",
     "sac_submit": "button[type='submit']",
-    "add_reservation_button": ".add_button, button:has-text('AGGIUNGI PRENOTAZIONE')",
+    "add_reservation_button": ".add_button, button:has-text('AGGIUNGI PRENOTAZIONE'), button:has-text('ADD RESERVATION'), button:has-text('RESERVIERUNG HINZUFUGEN'), button:has-text('RESERVIERUNG HINZUFÜGEN')",
     "hut_input": "#hutInput",
     "hut_options": "mat-option",
     "add_reservation_ok": "button:has-text('OK')",
@@ -61,6 +64,10 @@ def parse_args():
     parser.add_argument("--interval-seconds", type=int, default=300)
     parser.add_argument("--max-attempts", type=int, default=0)
     parser.add_argument("--jitter-seconds", type=int, default=0)
+    parser.add_argument("--alert-only", action="store_true")
+    parser.add_argument("--notify-command")
+    parser.add_argument("--alert-state-dir", default=".alert_state")
+    parser.add_argument("--alert-force-send", action="store_true")
     return parser.parse_args()
 
 
@@ -130,6 +137,23 @@ def optional_str(data, key):
     return value if value else None
 
 
+def optional_str_list(data, key, context):
+    if key not in data or data[key] is None:
+        return None
+    value = data[key]
+    if isinstance(value, str):
+        items = [part.strip() for part in value.split(",") if part.strip()]
+        return items or None
+    if isinstance(value, list):
+        items = []
+        for idx, item in enumerate(value):
+            if not isinstance(item, str) or not item.strip():
+                raise ValueError(f"{context}.{key}[{idx}] must be a non-empty string")
+            items.append(item.strip())
+        return items or None
+    raise ValueError(f"{context}.{key} must be a string or list of strings")
+
+
 def require_dict(data, key, context):
     if key not in data or not isinstance(data[key], dict):
         raise ValueError(f"{context}.{key} is required and must be a dict")
@@ -186,6 +210,10 @@ def load_config(path):
         "remarks": preferences.get("remarks"),
     }
 
+    alert = data.get("alert") or {}
+    if not isinstance(alert, dict):
+        raise ValueError("alert must be a dict if provided")
+
     half_board = require_bool(data, "half_board", "config")
     allow_alternative_dates = optional_bool(data, "allow_alternative_dates", default=False)
     allow_waitlist = optional_bool(data, "allow_waitlist", default=False)
@@ -234,6 +262,12 @@ def load_config(path):
         "poll_jitter_seconds": poll_jitter_seconds,
         "poll_max_attempts": poll_max_attempts,
         "stay": stay_out,
+        "alert": {
+            "to": optional_str_list(alert, "to", "alert") or [contact_out["email"]],
+            "command": optional_str(alert, "command"),
+            "any_party_size": optional_bool(alert, "any_party_size", default=True),
+            "any_night": optional_bool(alert, "any_night", default=False),
+        },
     }
 
 
@@ -244,6 +278,33 @@ def load_credentials():
     if not username or not password:
         raise ValueError("HUT_USERNAME and HUT_PASSWORD must be set in .env")
     return username, password
+
+
+def expand_alert_only_configs(configs, args):
+    if not args.alert_only:
+        return configs
+
+    expanded = []
+    for config in configs:
+        if not config["alert"].get("any_night"):
+            expanded.append(config)
+            continue
+
+        start = parse_date(config["check_in"], "check_in")
+        end = parse_date(config["check_out"], "check_out")
+        current = start
+        while current < end:
+            nightly = deepcopy(config)
+            next_day = current + timedelta(days=1)
+            nightly["check_in"] = current.isoformat()
+            nightly["check_out"] = next_day.isoformat()
+            nightly["_alert_parent_range"] = {
+                "check_in": config["check_in"],
+                "check_out": config["check_out"],
+            }
+            expanded.append(nightly)
+            current = next_day
+    return expanded
 
 
 def snap(page, screenshot_dir, step, label):
@@ -403,39 +464,103 @@ def wait_for_booking_wizard(page, timeout_ms=WIZARD_TIMEOUT_MS):
     raise RuntimeError(f"Did not reach booking wizard after hut selection. Current URL: {page.url}")
 
 
+def ensure_authenticated_list(page, timeout_ms=45000):
+    deadline = time.time() + (timeout_ms / 1000)
+    last_url = page.url or ""
+    page.wait_for_timeout(1500)
+    while time.time() < deadline:
+        page.goto(LIST_URL, wait_until="domcontentloaded")
+        page.wait_for_timeout(1000)
+        last_url = page.url or ""
+        if last_url.startswith(LIST_URL):
+            return
+    raise RuntimeError(f"Login did not establish an authenticated session. Last URL: {last_url}")
+
+
 def choose_hut_option(page, hut_name):
     hut_input = must_locator(page, SELECTORS["hut_input"], "hut_input", DEFAULT_TIMEOUT_MS)
-    set_value(hut_input, hut_name)
-    page.keyboard.press("Enter")
-    page.wait_for_timeout(500)
-    options = page.locator(SELECTORS["hut_options"])
-    try:
-        page.wait_for_selector(SELECTORS["hut_options"], timeout=DEFAULT_TIMEOUT_MS)
-    except PlaywrightTimeoutError:
-        option_texts = []
-        if hut_input.first.input_value().strip():
-            return hut_name
-        raise RuntimeError("No hut options available after search")
-    option_texts = [options.nth(i).inner_text().strip() for i in range(options.count())]
-    if not option_texts:
-        if hut_input.first.input_value().strip():
-            return hut_name
-        raise RuntimeError("No hut options available after search")
-
     target_norm = normalize_text(hut_name)
-    option_norms = [normalize_text(text) for text in option_texts]
 
-    exact_matches = [i for i, text in enumerate(option_norms) if text == target_norm]
-    if len(exact_matches) == 1:
-        options.nth(exact_matches[0]).click()
-        return option_texts[exact_matches[0]]
+    def set_search_query(query):
+        hut_input.first.click()
+        hut_input.first.fill("")
+        page.wait_for_timeout(100)
+        page.keyboard.type(query, delay=35)
+        page.wait_for_timeout(500)
 
-    contains_matches = [i for i, text in enumerate(option_norms) if target_norm in text]
-    if len(contains_matches) == 1:
-        options.nth(contains_matches[0]).click()
-        return option_texts[contains_matches[0]]
+    def candidate_queries():
+        queries = []
 
-    raise RuntimeError(f"Ambiguous hut selection for '{hut_name}'. Options: {option_texts}")
+        def add(value):
+            if not value:
+                return
+            value = value.strip()
+            if len(value) < 4:
+                return
+            if value not in queries:
+                queries.append(value)
+
+        add(hut_name)
+        before_comma = hut_name.split(",")[0].strip()
+        add(before_comma)
+        before_suffix = re.sub(r"\s+SAC.*$", "", before_comma, flags=re.IGNORECASE).strip()
+        add(before_suffix)
+        first_word = before_suffix.split()[0] if before_suffix else None
+        add(first_word)
+        base = before_suffix or before_comma or hut_name
+        for length in (16, 12, 8, 5, 4):
+            if len(base) >= length:
+                add(base[:length])
+        return queries
+
+    last_options = []
+    for query in candidate_queries():
+        set_search_query(query)
+        options = page.locator(SELECTORS["hut_options"])
+        try:
+            page.wait_for_selector(SELECTORS["hut_options"], timeout=2500)
+        except PlaywrightTimeoutError:
+            continue
+
+        option_texts = [options.nth(i).inner_text().strip() for i in range(options.count())]
+        if not option_texts:
+            continue
+        last_options = option_texts
+        option_norms = [normalize_text(text) for text in option_texts]
+
+        exact_matches = [i for i, text in enumerate(option_norms) if text == target_norm]
+        if len(exact_matches) == 1:
+            options.nth(exact_matches[0]).click()
+            page.wait_for_timeout(250)
+            return option_texts[exact_matches[0]]
+
+        contains_matches = [i for i, text in enumerate(option_norms) if target_norm in text]
+        if len(contains_matches) == 1:
+            options.nth(contains_matches[0]).click()
+            page.wait_for_timeout(250)
+            return option_texts[contains_matches[0]]
+
+    if last_options:
+        raise RuntimeError(f"Ambiguous hut selection for '{hut_name}'. Options: {last_options}")
+    raise RuntimeError(f"No hut options available after search for '{hut_name}'")
+
+
+def confirm_hut_selection(page):
+    ok_button = must_locator(page, SELECTORS["add_reservation_ok"], "add_reservation_ok", DEFAULT_TIMEOUT_MS).first
+    for attempt in range(3):
+        try:
+            ok_button.click(timeout=DEFAULT_TIMEOUT_MS)
+        except PlaywrightTimeoutError:
+            ok_button.click(force=True)
+        try:
+            wait_for_booking_wizard(page, timeout_ms=8000 if attempt < 2 else WIZARD_TIMEOUT_MS)
+            return
+        except RuntimeError:
+            if "/reservation/book-hut/" in (page.url or ""):
+                return
+            page.keyboard.press("Enter")
+            page.wait_for_timeout(600)
+    wait_for_booking_wizard(page, timeout_ms=WIZARD_TIMEOUT_MS)
 
 
 def select_date_range(page, check_in, check_out):
@@ -1323,6 +1448,73 @@ def find_availability_continue_button(page):
     return None
 
 
+def find_availability_blocker_text(page):
+    patterns = [
+        "keine\\s+online-?reservationen\\s+moglich",
+        "keine\\s+online-?reservationen\\s+möglich",
+        "no\\s+online\\s+reservations?\\s+possible",
+        "nessuna\\s+prenotazione\\s+online\\s+possibile",
+    ]
+    for pattern in patterns:
+        locator = page.locator("text=/" + pattern + "/i")
+        if locator.count() == 0:
+            continue
+        try:
+            text = locator.first.inner_text().strip()
+        except Exception:
+            text = ""
+        return text or pattern
+    return None
+
+
+def find_positive_free_places(page):
+    headers = ["freie platze", "freie plätze", "free places", "posti liberi"]
+    best = None
+    tables = page.locator("table")
+    for i in range(tables.count()):
+        table = tables.nth(i)
+        try:
+            if not table.is_visible():
+                continue
+        except Exception:
+            pass
+        try:
+            text = normalize_date_text(table.inner_text())
+        except Exception:
+            continue
+        lower = text.lower()
+        if not any(header in lower for header in headers):
+            continue
+        matches = [int(match.group(1)) for match in re.finditer(r":\s*([1-9]\d*)\b", text)]
+        if not matches:
+            continue
+        candidate = max(matches)
+        if best is None or candidate > best:
+            best = candidate
+    return best
+
+
+def wait_for_positive_free_places(page, timeout_ms=4000):
+    deadline = time.time() + (timeout_ms / 1000)
+    stable_count = None
+    stable_hits = 0
+    while time.time() < deadline:
+        count = find_positive_free_places(page)
+        if count:
+            if count == stable_count:
+                stable_hits += 1
+            else:
+                stable_count = count
+                stable_hits = 1
+            if stable_hits >= 2:
+                return stable_count
+        else:
+            stable_count = None
+            stable_hits = 0
+        page.wait_for_timeout(250)
+    return stable_count
+
+
 def availability_advanced(page, timeout_ms=8000):
     if wait_for_visible(page, SELECTORS["next_overnight"], timeout_ms=min(1500, timeout_ms)):
         return True
@@ -1505,16 +1697,15 @@ def run_attempt(config, username, password, args, attempt_index=1):
             must_locator(page, SELECTORS["login_submit"], "login_submit", DEFAULT_TIMEOUT_MS).first.click()
         step = snap(page, screenshot_dir, step, "login")
 
-        page.goto(LIST_URL, wait_until="domcontentloaded")
+        ensure_authenticated_list(page)
         add_button = must_locator(page, SELECTORS["add_reservation_button"], "add_reservation_button", DEFAULT_TIMEOUT_MS)
         ensure_language_it(page)
         add_button.first.click()
         step = snap(page, screenshot_dir, step, "reservation_list")
 
         chosen_hut = choose_hut_option(page, config["hut_name"])
-        must_locator(page, SELECTORS["add_reservation_ok"], "add_reservation_ok", DEFAULT_TIMEOUT_MS).first.click()
         step = snap(page, screenshot_dir, step, f"hut_selected_{chosen_hut.replace(' ', '_')}")
-        wait_for_booking_wizard(page, timeout_ms=WIZARD_TIMEOUT_MS)
+        confirm_hut_selection(page)
         step = snap(page, screenshot_dir, step, "wizard_loaded")
         # Some huts render the wizard in German; support IT/DE for the wizard flow.
         ensure_language_any_of(page, {"IT", "DE"})
@@ -1523,10 +1714,20 @@ def run_attempt(config, username, password, args, attempt_index=1):
         step = snap(page, screenshot_dir, step, "dates_selected")
         ensure_expected_date_range(page, config["check_in"], config["check_out"], config["allow_alternative_dates"])
 
-        set_party_size_inputs(page, config["party_size"], config["preferences"].get("room_type"))
+        blocker_text = find_availability_blocker_text(page)
+        if blocker_text:
+            raise AvailabilityNotFoundError(f"Requested dates not available: {blocker_text}")
+
+        set_party_size_inputs(page, effective_party_size(config, args), config["preferences"].get("room_type"))
         page.keyboard.press("Tab")
+        page.wait_for_timeout(500)
         step = snap(page, screenshot_dir, step, "people_set")
         ensure_expected_date_range(page, config["check_in"], config["check_out"], config["allow_alternative_dates"])
+
+        free_places = wait_for_positive_free_places(page)
+        if args.alert_only and free_places:
+            browser.close()
+            return {"status": "availability_found", "free_places": free_places}
 
         next_check = find_availability_next_button(page)
         if next_check.is_disabled() and config["allow_waitlist"]:
@@ -1586,6 +1787,10 @@ def run_attempt(config, username, password, args, attempt_index=1):
             raise AvailabilityNotFoundError("Availability flow did not advance to overnight step.")
         step = snap(page, screenshot_dir, step, "availability_checked")
 
+        if args.alert_only:
+            browser.close()
+            return {"status": "availability_found"}
+
         wait_for_overnight_form(page)
         select_half_board(page, config["half_board"])
         fill_by_labels(page, ["Di cui bambini", "Bambini", "Davon Kinder", "Kinder"], config["stay"]["children_count"], "children_count")
@@ -1642,7 +1847,7 @@ def run_attempt(config, username, password, args, attempt_index=1):
 
         if args.dry_run:
             browser.close()
-            return
+            return {"status": "dry_run_ready"}
 
         def maybe_pause(label):
             if not args.pause_at_payment and args.pause_seconds <= 0:
@@ -1658,11 +1863,12 @@ def run_attempt(config, username, password, args, attempt_index=1):
             print("Reached final submit step. Run with --confirm-submit to click 'Invia'.")
             maybe_pause("Paused before submit")
             browser.close()
-            return
+            return {"status": "ready_to_submit"}
         submit_btn.click()
         step = snap(page, screenshot_dir, step, "submission_clicked")
         maybe_pause("Paused after submit")
         browser.close()
+        return {"status": "submitted"}
 
 
 def config_label(config):
@@ -1671,6 +1877,189 @@ def config_label(config):
 
 def config_tag(config):
     return slugify(f"{config['hut_name']}_{config['check_in']}_{config['check_out']}")
+
+
+def iso_now():
+    return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def alert_state_path(config, args):
+    return Path(args.alert_state_dir) / f"{config_tag(config)}.json"
+
+
+def effective_party_size(config, args):
+    if args.alert_only and config["alert"].get("any_party_size", True):
+        return 1
+    return config["party_size"]
+
+
+def load_alert_state(path):
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def save_alert_state(path, state):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def build_alert_payload(config, args, result=None):
+    check_in = parse_date(config["check_in"], "check_in")
+    check_out = parse_date(config["check_out"], "check_out")
+    nights = (check_out - check_in).days
+    checked_party_size = effective_party_size(config, args)
+    any_opening = args.alert_only and checked_party_size == 1 and config["alert"].get("any_party_size", True)
+    subject = f"Hut spot open: {config['hut_name']} {config['check_in']} -> {config['check_out']}"
+    body_lines = [
+        "A hut spot appears to be available for the requested stay.",
+        "",
+        f"Hut: {config['hut_name']}",
+        f"Dates: {config['check_in']} -> {config['check_out']} ({nights} night{'s' if nights != 1 else ''})",
+        f"Party size checked: {checked_party_size}",
+        f"Room preference: {config['preferences'].get('room_type') or 'any'}",
+        f"Detected at: {iso_now()}",
+        "",
+        "The bot reached the availability flow and could continue for the requested dates.",
+        f"Booking site: {LIST_URL}",
+    ]
+    parent_range = config.get("_alert_parent_range")
+    if parent_range:
+        body_lines.insert(
+            5,
+            f"Monitored window: {parent_range['check_in']} -> {parent_range['check_out']} (alerting on any single-night opening).",
+        )
+    if any_opening:
+        body_lines.insert(5, "Alert mode: any opening (the monitor checks for at least 1 available spot).")
+    if result and result.get("free_places"):
+        body_lines.insert(6, f"Visible free places detected: {result['free_places']}")
+    return {
+        "to": ", ".join(config["alert"]["to"]),
+        "to_list": list(config["alert"]["to"]),
+        "subject": subject,
+        "body": "\n".join(body_lines),
+        "checked_party_size": checked_party_size,
+    }
+
+
+def resolve_notify_command(config, args):
+    if args.notify_command is not None:
+        value = args.notify_command.strip()
+        return value or None
+    return config["alert"].get("command")
+
+
+def run_notify_command(command, payload, config):
+    env = os.environ.copy()
+    env.update(
+        {
+            "HUT_ALERT_TO": payload["to"] or "",
+            "HUT_ALERT_SUBJECT": payload["subject"],
+            "HUT_ALERT_BODY": payload["body"],
+            "HUT_ALERT_HUT_NAME": config["hut_name"],
+            "HUT_ALERT_CHECK_IN": config["check_in"],
+            "HUT_ALERT_CHECK_OUT": config["check_out"],
+            "HUT_ALERT_PARTY_SIZE": str(payload.get("checked_party_size") or config["party_size"]),
+            "HUT_ALERT_CONFIG_TAG": config_tag(config),
+        }
+    )
+    subprocess.run(command, shell=True, check=True, env=env)
+
+
+def handle_open_alert(config, args, result=None):
+    payload = build_alert_payload(config, args, result=result)
+    state_path = alert_state_path(config, args)
+    previous = load_alert_state(state_path)
+    current_free_places = result.get("free_places") if result else None
+    already_open = previous.get("status") == "open" and previous.get("last_notified_at")
+    previous_free_places = previous.get("last_open_free_places")
+
+    if args.dry_run:
+        print(f"[dry-run] Would alert for {config_label(config)}")
+        print(payload["subject"])
+        print(payload["body"])
+        return "dry-run"
+
+    if already_open and not args.alert_force_send and previous_free_places in {None, current_free_places}:
+        previous["last_checked_at"] = iso_now()
+        previous["last_open_free_places"] = current_free_places
+        save_alert_state(state_path, previous)
+        print(f"{config_label(config)}: availability is unchanged; alert already sent.")
+        return "suppressed"
+
+    command = resolve_notify_command(config, args)
+    try:
+        if command:
+            run_notify_command(command, payload, config)
+            mode = "command"
+        else:
+            print(payload["subject"])
+            print(payload["body"])
+            mode = "stdout"
+    except Exception as exc:
+        save_alert_state(
+            state_path,
+            {
+                "status": "open",
+                "last_checked_at": iso_now(),
+                "last_notification_error": str(exc),
+                "last_notified_at": previous.get("last_notified_at"),
+                "last_notification_mode": previous.get("last_notification_mode"),
+                "last_subject": payload["subject"],
+                "last_to": payload["to"],
+                "last_open_free_places": current_free_places,
+            },
+        )
+        print(f"{config_label(config)}: alert delivery failed: {exc}")
+        return "failed"
+
+    save_alert_state(
+        state_path,
+        {
+            "status": "open",
+            "last_checked_at": iso_now(),
+            "last_notified_at": iso_now(),
+            "last_notification_mode": mode,
+            "last_subject": payload["subject"],
+            "last_to": payload["to"],
+            "last_notification_error": None,
+            "last_open_free_places": current_free_places,
+        },
+    )
+    print(f"{config_label(config)}: open availability alert emitted via {mode}.")
+    return mode
+
+
+def record_closed_state(config, args, reason):
+    if args.dry_run:
+        print(f"[dry-run] {config_label(config)} unavailable: {reason}")
+        return
+
+    state_path = alert_state_path(config, args)
+    previous = load_alert_state(state_path)
+    save_alert_state(
+        state_path,
+        {
+            "status": "closed",
+            "last_checked_at": iso_now(),
+            "last_reason": str(reason),
+            "last_notified_at": previous.get("last_notified_at"),
+            "last_notification_mode": previous.get("last_notification_mode"),
+            "last_subject": previous.get("last_subject"),
+            "last_to": previous.get("last_to"),
+            "last_open_free_places": previous.get("last_open_free_places"),
+        },
+    )
+
+
+def summarize_availability_failures(configs, failures):
+    parts = []
+    for idx, exc in failures:
+        parts.append(f"{config_label(configs[idx])}: {exc}")
+    return "No config succeeded. " + " | ".join(parts)
 
 
 def resolve_poll_settings(configs, poll_flags, args):
@@ -1690,7 +2079,7 @@ def resolve_poll_settings(configs, poll_flags, args):
 
 def main():
     args = parse_args()
-    configs = [load_config(path) for path in args.config]
+    configs = expand_alert_only_configs([load_config(path) for path in args.config], args)
     username, password = load_credentials()
 
     poll_flags = [args.poll or cfg["auto_poll_if_full"] for cfg in configs]
@@ -1705,6 +2094,27 @@ def main():
             args_per_config.append(clone_args(args, screenshot_dir=str(cfg_dir)))
     else:
         args_per_config = [args for _ in configs]
+
+    def on_success(cfg, cfg_args, result):
+        if cfg_args.alert_only:
+            handle_open_alert(cfg, cfg_args, result=result)
+            return
+        status = (result or {}).get("status")
+        if status == "dry_run_ready":
+            print(f"Booking flow reached the final step in dry-run mode for {config_label(cfg)}.")
+        elif status == "ready_to_submit":
+            print(f"Booking flow reached the final submit step for {config_label(cfg)}.")
+        elif status == "submitted":
+            print(f"Booking submission clicked for {config_label(cfg)}.")
+        else:
+            print(f"Booking flow completed for {config_label(cfg)}.")
+
+    def on_unavailable(cfg, cfg_args, exc):
+        if cfg_args.alert_only:
+            record_closed_state(cfg, cfg_args, exc)
+            print(f"{config_label(cfg)}: {exc}")
+            return
+        raise exc
 
     if len(configs) == 1:
         config = configs[0]
@@ -1721,22 +2131,46 @@ def main():
             while True:
                 attempt += 1
                 try:
-                    run_attempt(config, username, password, config_args, attempt_index=attempt)
-                    print("Booking flow completed.")
-                    return
+                    result = run_attempt(config, username, password, config_args, attempt_index=attempt)
+                    on_success(config, config_args, result)
+                    if not config_args.alert_only:
+                        return
                 except AvailabilityNotFoundError as exc:
-                    if max_attempts and attempt >= max_attempts:
+                    if not config_args.alert_only and max_attempts and attempt >= max_attempts:
                         raise
-                    wait_time = interval_seconds + (random.randint(0, jitter_seconds) if jitter_seconds else 0)
-                    print(f"Attempt {attempt}: {exc}. Retrying in {wait_time}s.")
-                    time.sleep(wait_time)
+                    on_unavailable(config, config_args, exc)
+                if max_attempts and attempt >= max_attempts:
+                    return
+                wait_time = interval_seconds + (random.randint(0, jitter_seconds) if jitter_seconds else 0)
+                print(f"Attempt {attempt} complete. Retrying in {wait_time}s.")
+                time.sleep(wait_time)
         else:
-            run_attempt(config, username, password, config_args, attempt_index=1)
+            try:
+                result = run_attempt(config, username, password, config_args, attempt_index=1)
+                on_success(config, config_args, result)
+            except AvailabilityNotFoundError as exc:
+                if config_args.alert_only:
+                    on_unavailable(config, config_args, exc)
+                else:
+                    raise
         return
 
     if not poll_enabled:
-        for cfg, cfg_args in zip(configs, args_per_config):
-            run_attempt(cfg, username, password, cfg_args, attempt_index=1)
+        availability_failures = []
+        for idx, (cfg, cfg_args) in enumerate(zip(configs, args_per_config)):
+            try:
+                result = run_attempt(cfg, username, password, cfg_args, attempt_index=1)
+                on_success(cfg, cfg_args, result)
+                if not cfg_args.alert_only:
+                    return
+            except AvailabilityNotFoundError as exc:
+                if cfg_args.alert_only:
+                    on_unavailable(cfg, cfg_args, exc)
+                else:
+                    availability_failures.append((idx, exc))
+                    print(f"{config_label(cfg)}: {exc}")
+        if availability_failures:
+            raise AvailabilityNotFoundError(summarize_availability_failures(configs, availability_failures))
         return
 
     interval_seconds, jitter_seconds, max_attempts = poll_settings
@@ -1753,7 +2187,16 @@ def main():
         if flag:
             pending.append(idx)
         else:
-            run_attempt(configs[idx], username, password, args_per_config[idx], attempt_index=1)
+            try:
+                result = run_attempt(configs[idx], username, password, args_per_config[idx], attempt_index=1)
+                on_success(configs[idx], args_per_config[idx], result)
+                if not args_per_config[idx].alert_only:
+                    return
+            except AvailabilityNotFoundError as exc:
+                if args_per_config[idx].alert_only:
+                    on_unavailable(configs[idx], args_per_config[idx], exc)
+                else:
+                    raise
 
     cycle = 0
     while pending:
@@ -1761,14 +2204,15 @@ def main():
         for idx in list(pending):
             attempt_counts[idx] += 1
             try:
-                run_attempt(configs[idx], username, password, args_per_config[idx], attempt_index=attempt_counts[idx])
-                print(f"Booking flow completed for {config_label(configs[idx])}.")
-                pending.remove(idx)
+                result = run_attempt(configs[idx], username, password, args_per_config[idx], attempt_index=attempt_counts[idx])
+                on_success(configs[idx], args_per_config[idx], result)
+                if not args_per_config[idx].alert_only:
+                    return
             except AvailabilityNotFoundError as exc:
-                if max_attempts and cycle >= max_attempts:
+                if not args_per_config[idx].alert_only and max_attempts and cycle >= max_attempts:
                     raise
-                print(f"{config_label(configs[idx])}: {exc}")
-        if not pending:
+                on_unavailable(configs[idx], args_per_config[idx], exc)
+        if max_attempts and cycle >= max_attempts:
             return
         wait_time = interval_seconds + (random.randint(0, jitter_seconds) if jitter_seconds else 0)
         print(f"Pending {len(pending)} configs. Retrying in {wait_time}s.")
