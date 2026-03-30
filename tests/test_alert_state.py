@@ -34,6 +34,16 @@ def make_args(tmpdir):
 
 
 class AlertStateTests(unittest.TestCase):
+    def test_extract_free_places_from_text_can_target_room_label(self):
+        text = (
+            "Data | Posti Liberi | Ven | 03.04.2026 | 8 | "
+            "Dormitorio: | 8 | Camera doppia: | 0"
+        )
+
+        self.assertEqual(book.extract_free_places_from_text(text), 8)
+        self.assertEqual(book.extract_free_places_from_text(text, room_label="Dormitorio"), 8)
+        self.assertEqual(book.extract_free_places_from_text(text, room_label="Camera doppia"), 0)
+
     def test_same_count_is_suppressed_but_reopen_resends(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             config = make_config()
@@ -69,6 +79,29 @@ class AlertStateTests(unittest.TestCase):
             self.assertEqual(second, "command")
             self.assertEqual(third, "suppressed")
             self.assertEqual(notify.call_count, 2)
+
+    def test_payload_includes_room_breakdown_for_any_room_alert(self):
+        config = make_config()
+        config["preferences"]["room_type"] = None
+        args = make_args("/tmp/unused")
+
+        payload = book.build_alert_payload(
+            config,
+            args,
+            result={
+                "free_places": 6,
+                "room_counts": [
+                    {"label": "Dormitorio", "free_places": 4},
+                    {"label": "Camera doppia", "free_places": 2},
+                ],
+            },
+        )
+
+        self.assertIn("Visible free places detected: 6", payload["body"])
+        self.assertIn(
+            "Visible free places by room category: Dormitorio: 4, Camera doppia: 2",
+            payload["body"],
+        )
 
 
 if __name__ == "__main__":

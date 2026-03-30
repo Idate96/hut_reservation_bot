@@ -21,7 +21,8 @@ python -m playwright install
 7. If you want polling only, set `allow_waitlist: false`.
 8. Optional: add an `alert` block for monitor-only runs. `alert.to` may be a single email, a comma-separated string, or a YAML list; it defaults to `contact.email`. `alert.command` can be any shell command and receives `HUT_ALERT_TO`, `HUT_ALERT_SUBJECT`, `HUT_ALERT_BODY`, `HUT_ALERT_HUT_NAME`, `HUT_ALERT_CHECK_IN`, and `HUT_ALERT_CHECK_OUT` in the environment.
 9. Set `alert.any_night: true` if `check_in` and `check_out` define a monitoring window and you want alerts for any single free night inside that window. For example, `2026-04-03 -> 2026-04-06` expands to checks for `2026-04-03 -> 2026-04-04`, `2026-04-04 -> 2026-04-05`, and `2026-04-05 -> 2026-04-06`.
-10. Update the `SELECTORS` map inside `book.py` if the UI changes.
+10. For alert-only monitoring across all room categories in a hut, set `preferences.room_type: null`. The bot will probe each visible room category separately and sum the visible counts in the alert payload.
+11. Update the `SELECTORS` map inside `book.py` if the UI changes.
 
 ## Run
 ```
@@ -39,6 +40,13 @@ python book.py --config config_konkordia_2026-04-03.yaml --poll --interval-secon
 python book.py --config config_oberaarjoch_2026-04-05_06_alert.yaml --alert-only --poll
 ```
 Use `--max-attempts N` to stop after N checks. Polling retries only when dates are unavailable; any other error stops immediately. Enable `allow_waitlist` if you want to continue even when full.
+
+## Watchdog
+To supervise the alert poller, run:
+```
+python watch_hut_alerts.py
+```
+The watchdog checks once per hour by default. It verifies that the `tmux` poller session exists, that the `book.py --alert-only --poll --headless` process is alive, and that the expected `.alert_state/` files are still moving. If not, it restarts the monitor session automatically. Watchdog output is written to `logs/hut_alerts_watchdog.log`.
 
 ## Alerting
 `--alert-only` stops after the availability step. If the requested dates are open, the bot emits an alert instead of continuing to the booking form.

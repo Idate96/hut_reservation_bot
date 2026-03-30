@@ -329,6 +329,10 @@ def set_value(locator, value):
     locator.first.fill(str(value))
 
 
+def click_submit(locator):
+    locator.first.click(force=True, no_wait_after=True)
+
+
 def set_select_or_input(locator, value):
     tag = locator.first.evaluate("el => el.tagName.toLowerCase()")
     if tag == "select":
@@ -596,42 +600,123 @@ def select_date_range(page, check_in, check_out):
     page.keyboard.press("Escape")
 
 
-def choose_people_input(page, room_type):
-    def first_visible(locator):
-        for i in range(locator.count()):
+def first_visible_locator(locator):
+    for i in range(locator.count()):
+        try:
             if locator.nth(i).is_visible():
                 return locator.nth(i)
-        return locator.first if locator.count() else None
+        except Exception:
+            continue
+    return locator.first if locator.count() else None
 
-    def expand_people_panel():
-        # Some huts hide the per-category people inputs behind an expansion panel titled
-        # "Num. di persone". Expanding it proactively avoids false "no input" failures.
-        headers = page.locator("mat-expansion-panel-header")
-        for i in range(headers.count()):
-            header = headers.nth(i)
+
+def expand_people_panel(page):
+    # Some huts hide the per-category people inputs behind an expansion panel titled
+    # "Num. di persone". Expanding it proactively avoids false "no input" failures.
+    headers = page.locator("mat-expansion-panel-header")
+    for i in range(headers.count()):
+        header = headers.nth(i)
+        try:
+            text = normalize_text(header.inner_text())
+        except Exception:
+            continue
+        if any(normalize_text(label) in text for label in PEOPLE_TOTAL_LABELS):
+            panel = header.locator("xpath=ancestor-or-self::mat-expansion-panel[1]")
             try:
-                text = normalize_text(header.inner_text())
+                panel_class = panel.get_attribute("class") or ""
             except Exception:
-                continue
-            if any(normalize_text(label) in text for label in PEOPLE_TOTAL_LABELS):
-                panel = header.locator("xpath=ancestor-or-self::mat-expansion-panel[1]")
-                try:
-                    panel_class = panel.get_attribute("class") or ""
-                except Exception:
-                    panel_class = ""
-                if "mat-expanded" not in panel_class:
-                    header.click()
-                    page.wait_for_timeout(250)
-                return panel
-        return None
+                panel_class = ""
+            if "mat-expanded" not in panel_class:
+                header.click()
+                page.wait_for_timeout(250)
+            return panel
+    return None
 
+
+def people_input_context_text(input_loc):
+    parts = []
+    try:
+        parts.append(input_loc.get_attribute("aria-label") or "")
+    except Exception:
+        pass
+    try:
+        parts.append(input_loc.get_attribute("placeholder") or "")
+    except Exception:
+        pass
+    try:
+        field = input_loc.locator("xpath=ancestor-or-self::mat-form-field[1]")
+        if field.count() > 0:
+            parts.append(field.first.inner_text())
+    except Exception:
+        pass
+    try:
+        panel_header = input_loc.locator(
+            "xpath=ancestor-or-self::mat-expansion-panel[1]//mat-expansion-panel-header"
+        )
+        if panel_header.count() > 0:
+            parts.append(panel_header.first.inner_text())
+    except Exception:
+        pass
+    return normalize_text(" ".join(parts))
+
+
+def people_input_label(input_loc, index):
+    try:
+        aria = (input_loc.get_attribute("aria-label") or "").strip()
+    except Exception:
+        aria = ""
+    if aria:
+        label = aria.split(":", 1)[0].strip()
+        if label:
+            return label
+    return f"Option {index}"
+
+
+def visible_people_inputs(page):
+    inputs = page.locator(SELECTORS["people_input"])
+    if inputs.count() == 0:
+        expand_people_panel(page)
+        inputs = page.locator(SELECTORS["people_input"])
+    visible = []
+    for i in range(inputs.count()):
+        candidate = inputs.nth(i)
+        try:
+            if candidate.is_visible():
+                visible.append(candidate)
+        except Exception:
+            continue
+    if visible:
+        return visible
+    if inputs.count() == 1:
+        return [inputs.first]
+    return []
+
+
+def wait_for_visible_people_inputs(page, timeout_ms=5000):
+    deadline = time.time() + (timeout_ms / 1000)
+    while time.time() < deadline:
+        inputs = visible_people_inputs(page)
+        if inputs:
+            return inputs
+        page.wait_for_timeout(250)
+    return visible_people_inputs(page)
+
+
+def reclassify_party_size_error(exc):
+    message = str(exc or "").strip()
+    if message == "No people input found":
+        return AvailabilityNotFoundError(message)
+    return None
+
+
+def choose_people_input(page, room_type):
     def select_room_category_option(room_type_value):
         keywords = ROOM_TYPE_KEYWORDS.get(room_type_value, [room_type_value])
         keywords = [normalize_text(k) for k in keywords if k]
         if not keywords:
             return False
 
-        root = expand_people_panel()
+        root = expand_people_panel(page)
         root = root if root is not None else page
 
         comboboxes = root.locator("[role='combobox']")
@@ -681,32 +766,6 @@ def choose_people_input(page, room_type):
 
         return False
 
-    def input_context_text(input_loc):
-        parts = []
-        try:
-            parts.append(input_loc.get_attribute("aria-label") or "")
-        except Exception:
-            pass
-        try:
-            parts.append(input_loc.get_attribute("placeholder") or "")
-        except Exception:
-            pass
-        try:
-            field = input_loc.locator("xpath=ancestor-or-self::mat-form-field[1]")
-            if field.count() > 0:
-                parts.append(field.first.inner_text())
-        except Exception:
-            pass
-        try:
-            panel_header = input_loc.locator(
-                "xpath=ancestor-or-self::mat-expansion-panel[1]//mat-expansion-panel-header"
-            )
-            if panel_header.count() > 0:
-                parts.append(panel_header.first.inner_text())
-        except Exception:
-            pass
-        return normalize_text(" ".join(parts))
-
     if room_type:
         keywords = ROOM_TYPE_KEYWORDS.get(room_type, [room_type])
 
@@ -723,7 +782,7 @@ def choose_people_input(page, room_type):
                     header.click()
                     page.wait_for_timeout(200)
                 panel_inputs = panels.nth(i).locator("input")
-                selected = first_visible(panel_inputs)
+                selected = first_visible_locator(panel_inputs)
                 if selected is None:
                     raise RuntimeError(f"No people input found inside room panel '{header_text}'")
                 return selected
@@ -739,14 +798,14 @@ def choose_people_input(page, room_type):
                 continue
             if any(keyword in label_text for keyword in keywords):
                 field_inputs = fields.nth(i).locator("input")
-                selected = first_visible(field_inputs)
+                selected = first_visible_locator(field_inputs)
                 if selected is None:
                     raise RuntimeError(f"Room field '{label_text}' has no input")
                 return selected
 
     inputs = page.locator(SELECTORS["people_input"])
     if inputs.count() == 0:
-        expand_people_panel()
+        expand_people_panel(page)
         inputs = page.locator(SELECTORS["people_input"])
     if inputs.count() == 0:
         raise RuntimeError("No people input found")
@@ -756,7 +815,7 @@ def choose_people_input(page, room_type):
 
         matches = []
         for i in range(inputs.count()):
-            ctx = input_context_text(inputs.nth(i))
+            ctx = people_input_context_text(inputs.nth(i))
             if any(k in ctx for k in keywords_norm):
                 matches.append(inputs.nth(i))
         # If we cannot match directly, some huts require selecting a category (mat-select)
@@ -764,7 +823,7 @@ def choose_people_input(page, room_type):
         if not matches and select_room_category_option(room_type):
             inputs = page.locator(SELECTORS["people_input"])
             for i in range(inputs.count()):
-                ctx = input_context_text(inputs.nth(i))
+                ctx = people_input_context_text(inputs.nth(i))
                 if any(k in ctx for k in keywords_norm):
                     matches.append(inputs.nth(i))
 
@@ -1147,6 +1206,41 @@ def set_party_size_inputs(page, party_size, room_type):
     return room_input
 
 
+def probe_any_room_free_places(page, party_size):
+    inputs = wait_for_visible_people_inputs(page)
+    if not inputs:
+        raise RuntimeError("No people input found")
+
+    if len(inputs) == 1:
+        label = people_input_label(inputs[0], 1)
+        set_party_size_inputs(page, party_size, None)
+        page.keyboard.press("Tab")
+        page.wait_for_timeout(500)
+        free_places = wait_for_room_free_places(page, label)
+        if free_places == 0:
+            free_places = None
+        room_counts = []
+        if free_places:
+            room_counts.append({"label": label, "free_places": free_places})
+        return {"free_places": free_places, "room_counts": room_counts}
+
+    room_counts = []
+    for idx, current in enumerate(inputs, start=1):
+        label = people_input_label(current, idx)
+        for reset in inputs:
+            fill_input_or_validate(reset, 0, f"room_type_people_reset_{idx}")
+        page.wait_for_timeout(250)
+        fill_input_or_validate(current, party_size, f"room_type_people_{idx}")
+        page.keyboard.press("Tab")
+        page.wait_for_timeout(500)
+        free_places = wait_for_room_free_places(page, label)
+        if free_places:
+            room_counts.append({"label": label, "free_places": free_places})
+
+    total_free_places = sum(item["free_places"] for item in room_counts) or None
+    return {"free_places": total_free_places, "room_counts": room_counts}
+
+
 def fill_by_labels(page, labels, value, field_name):
     if value is None:
         return
@@ -1467,8 +1561,33 @@ def find_availability_blocker_text(page):
     return None
 
 
+FREE_PLACE_HEADERS = ["freie platze", "freie plätze", "free places", "posti liberi"]
+
+
+def extract_free_places_from_text(text, room_label=None):
+    normalized = normalize_text(normalize_date_text(text))
+    if not any(header in normalized for header in FREE_PLACE_HEADERS):
+        return None
+
+    if room_label:
+        label = normalize_text(room_label)
+        if not label:
+            return None
+        matches = [
+            int(match.group(1))
+            for match in re.finditer(rf"{re.escape(label)}\s*:\s*(?:\|\s*)?(\d+)\b", normalized)
+        ]
+        if not matches:
+            return None
+        return max(matches)
+
+    matches = [int(match.group(1)) for match in re.finditer(r":\s*(?:\|\s*)?([1-9]\d*)\b", normalized)]
+    if not matches:
+        return None
+    return max(matches)
+
+
 def find_positive_free_places(page):
-    headers = ["freie platze", "freie plätze", "free places", "posti liberi"]
     best = None
     tables = page.locator("table")
     for i in range(tables.count()):
@@ -1479,28 +1598,46 @@ def find_positive_free_places(page):
         except Exception:
             pass
         try:
-            text = normalize_date_text(table.inner_text())
+            text = table.inner_text()
         except Exception:
             continue
-        lower = text.lower()
-        if not any(header in lower for header in headers):
+        candidate = extract_free_places_from_text(text)
+        if candidate is None:
             continue
-        matches = [int(match.group(1)) for match in re.finditer(r":\s*([1-9]\d*)\b", text)]
-        if not matches:
-            continue
-        candidate = max(matches)
         if best is None or candidate > best:
             best = candidate
     return best
 
 
-def wait_for_positive_free_places(page, timeout_ms=4000):
+def find_room_free_places(page, room_label):
+    best = None
+    tables = page.locator("table")
+    for i in range(tables.count()):
+        table = tables.nth(i)
+        try:
+            if not table.is_visible():
+                continue
+        except Exception:
+            pass
+        try:
+            text = table.inner_text()
+        except Exception:
+            continue
+        candidate = extract_free_places_from_text(text, room_label=room_label)
+        if candidate is None:
+            continue
+        if best is None or candidate > best:
+            best = candidate
+    return best
+
+
+def wait_for_stable_free_places(page, read_count, timeout_ms=4000, allow_zero=False):
     deadline = time.time() + (timeout_ms / 1000)
     stable_count = None
     stable_hits = 0
     while time.time() < deadline:
-        count = find_positive_free_places(page)
-        if count:
+        count = read_count()
+        if count is not None and (allow_zero or count > 0):
             if count == stable_count:
                 stable_hits += 1
             else:
@@ -1513,6 +1650,16 @@ def wait_for_positive_free_places(page, timeout_ms=4000):
             stable_hits = 0
         page.wait_for_timeout(250)
     return stable_count
+
+
+def wait_for_positive_free_places(page, timeout_ms=4000):
+    return wait_for_stable_free_places(page, lambda: find_positive_free_places(page), timeout_ms=timeout_ms)
+
+
+def wait_for_room_free_places(page, room_label, timeout_ms=4000):
+    return wait_for_stable_free_places(
+        page, lambda: find_room_free_places(page, room_label), timeout_ms=timeout_ms, allow_zero=True
+    )
 
 
 def availability_advanced(page, timeout_ms=8000):
@@ -1688,13 +1835,13 @@ def run_attempt(config, username, password, args, attempt_index=1):
             pass_input = must_locator(page, SELECTORS["sac_password"], "sac_password", DEFAULT_TIMEOUT_MS)
             set_value(user_input, username)
             set_value(pass_input, password)
-            must_locator(page, SELECTORS["sac_submit"], "sac_submit", DEFAULT_TIMEOUT_MS).first.click()
+            click_submit(must_locator(page, SELECTORS["sac_submit"], "sac_submit", DEFAULT_TIMEOUT_MS))
         else:
             user_input = must_locator(page, SELECTORS["login_username"], "login_username", DEFAULT_TIMEOUT_MS)
             pass_input = must_locator(page, SELECTORS["login_password"], "login_password", DEFAULT_TIMEOUT_MS)
             set_value(user_input, username)
             set_value(pass_input, password)
-            must_locator(page, SELECTORS["login_submit"], "login_submit", DEFAULT_TIMEOUT_MS).first.click()
+            click_submit(must_locator(page, SELECTORS["login_submit"], "login_submit", DEFAULT_TIMEOUT_MS))
         step = snap(page, screenshot_dir, step, "login")
 
         ensure_authenticated_list(page)
@@ -1718,16 +1865,29 @@ def run_attempt(config, username, password, args, attempt_index=1):
         if blocker_text:
             raise AvailabilityNotFoundError(f"Requested dates not available: {blocker_text}")
 
-        set_party_size_inputs(page, effective_party_size(config, args), config["preferences"].get("room_type"))
-        page.keyboard.press("Tab")
-        page.wait_for_timeout(500)
+        checked_party_size = effective_party_size(config, args)
+        room_type = config["preferences"].get("room_type")
+        try:
+            if args.alert_only and room_type is None:
+                availability_probe = probe_any_room_free_places(page, checked_party_size)
+                free_places = availability_probe.get("free_places")
+            else:
+                set_party_size_inputs(page, checked_party_size, room_type)
+                page.keyboard.press("Tab")
+                page.wait_for_timeout(500)
+                free_places = wait_for_positive_free_places(page)
+                availability_probe = {"free_places": free_places}
+        except RuntimeError as exc:
+            mapped = reclassify_party_size_error(exc)
+            if mapped is not None:
+                raise mapped
+            raise
         step = snap(page, screenshot_dir, step, "people_set")
         ensure_expected_date_range(page, config["check_in"], config["check_out"], config["allow_alternative_dates"])
 
-        free_places = wait_for_positive_free_places(page)
         if args.alert_only and free_places:
             browser.close()
-            return {"status": "availability_found", "free_places": free_places}
+            return {"status": "availability_found", **availability_probe}
 
         next_check = find_availability_next_button(page)
         if next_check.is_disabled() and config["allow_waitlist"]:
@@ -1788,8 +1948,10 @@ def run_attempt(config, username, password, args, attempt_index=1):
         step = snap(page, screenshot_dir, step, "availability_checked")
 
         if args.alert_only:
+            if not availability_probe.get("free_places"):
+                raise AvailabilityNotFoundError("No positive free places shown on availability step.")
             browser.close()
-            return {"status": "availability_found"}
+            return {"status": "availability_found", **availability_probe}
 
         wait_for_overnight_form(page)
         select_half_board(page, config["half_board"])
@@ -1936,6 +2098,9 @@ def build_alert_payload(config, args, result=None):
         body_lines.insert(5, "Alert mode: any opening (the monitor checks for at least 1 available spot).")
     if result and result.get("free_places"):
         body_lines.insert(6, f"Visible free places detected: {result['free_places']}")
+    if result and result.get("room_counts"):
+        details = ", ".join(f"{item['label']}: {item['free_places']}" for item in result["room_counts"])
+        body_lines.insert(7, f"Visible free places by room category: {details}")
     return {
         "to": ", ".join(config["alert"]["to"]),
         "to_list": list(config["alert"]["to"]),

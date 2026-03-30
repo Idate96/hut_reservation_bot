@@ -35,7 +35,7 @@ contact:
   country: "Switzerland"
 
 preferences:
-  room_type: "dorm"
+  room_type: "dorm"  # set to null in alert-only mode to scan all visible room categories
   remarks: "Please book lower bunks if possible."
 
 accept_terms: true
