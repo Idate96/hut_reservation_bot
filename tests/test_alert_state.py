@@ -33,7 +33,45 @@ def make_args(tmpdir):
     )
 
 
+class FakeInput:
+    def __init__(self, visible):
+        self._visible = visible
+
+    def is_visible(self):
+        return self._visible
+
+
+class FakeLocatorCollection:
+    def __init__(self, items):
+        self._items = items
+
+    def count(self):
+        return len(self._items)
+
+    def nth(self, index):
+        return self._items[index]
+
+
 class AlertStateTests(unittest.TestCase):
+    def test_text_indicates_overlap_dialog_in_italian(self):
+        text = "Hai gia una prenotazione per lo stesso giorno. Vuoi procedere comunque?"
+        self.assertTrue(book.text_indicates_overlap_dialog(text))
+
+    def test_text_indicates_multi_booking_dialog(self):
+        text = (
+            "Prenotazione multipla rilevata! Hai gia prenotato uno o piu rifugi per questo periodo. "
+            "MODIFICA DATA ALLE MIE PRENOTAZIONI IGNORA"
+        )
+        self.assertTrue(book.text_indicates_overlap_dialog(text))
+
+    def test_text_indicates_overlap_dialog_does_not_match_generic_submit_text(self):
+        text = "Si prega di verificare i dati della prenotazione e inviare."
+        self.assertFalse(book.text_indicates_overlap_dialog(text))
+
+    def test_label_matches_does_not_confuse_nome_with_cognome(self):
+        self.assertTrue(book.label_matches("Nome", ["Nome"]))
+        self.assertFalse(book.label_matches("Cognome", ["Nome"]))
+
     def test_extract_free_places_from_text_can_target_room_label(self):
         text = (
             "Data | Posti Liberi | Ven | 03.04.2026 | 8 | "
@@ -80,6 +118,25 @@ class AlertStateTests(unittest.TestCase):
             self.assertEqual(third, "suppressed")
             self.assertEqual(notify.call_count, 2)
 
+    def test_error_state_preserves_last_open_count(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = make_config()
+            args = make_args(tmpdir)
+
+            with patch("book.run_notify_command"):
+                book.handle_open_alert(config, args, result={"free_places": 7})
+
+            book.record_error_state(config, args, RuntimeError("Date range input(s) not found on availability step"))
+
+            state_path = Path(tmpdir) / f"{book.config_tag(config)}.json"
+            state = book.load_alert_state(state_path)
+            self.assertEqual(state["status"], "error")
+            self.assertEqual(state["last_open_free_places"], 7)
+            self.assertEqual(
+                state["last_reason"],
+                "Date range input(s) not found on availability step",
+            )
+
     def test_payload_includes_room_breakdown_for_any_room_alert(self):
         config = make_config()
         config["preferences"]["room_type"] = None
@@ -102,6 +159,15 @@ class AlertStateTests(unittest.TestCase):
             "Visible free places by room category: Dormitorio: 4, Camera doppia: 2",
             payload["body"],
         )
+
+    def test_first_visible_locator_does_not_fallback_to_hidden_input(self):
+        locator = FakeLocatorCollection([FakeInput(False)])
+        self.assertIsNone(book.first_visible_locator(locator))
+
+    def test_first_visible_locator_returns_visible_input(self):
+        visible = FakeInput(True)
+        locator = FakeLocatorCollection([FakeInput(False), visible])
+        self.assertIs(book.first_visible_locator(locator), visible)
 
 
 if __name__ == "__main__":

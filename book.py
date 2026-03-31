@@ -257,6 +257,7 @@ def load_config(path):
         "half_board": half_board,
         "allow_alternative_dates": allow_alternative_dates,
         "allow_waitlist": allow_waitlist,
+        "require_positive_free_places": optional_bool(data, "require_positive_free_places", default=False),
         "auto_poll_if_full": auto_poll_if_full,
         "poll_interval_seconds": poll_interval_seconds,
         "poll_jitter_seconds": poll_jitter_seconds,
@@ -481,6 +482,48 @@ def ensure_authenticated_list(page, timeout_ms=45000):
     raise RuntimeError(f"Login did not establish an authenticated session. Last URL: {last_url}")
 
 
+def login_and_open_list(page, username, password, login_provider, max_attempts=2):
+    last_exc = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            page.goto(f"{BASE_URL}/login", wait_until="domcontentloaded")
+            if login_provider == "sac":
+                sac_button = must_locator(page, SELECTORS["login_sac_button"], "login_sac_button", DEFAULT_TIMEOUT_MS)
+                sac_button.first.click()
+                page.wait_for_load_state("domcontentloaded")
+
+                user_input = must_locator(page, SELECTORS["sac_username"], "sac_username", DEFAULT_TIMEOUT_MS)
+                pass_input = must_locator(page, SELECTORS["sac_password"], "sac_password", DEFAULT_TIMEOUT_MS)
+                set_value(user_input, username)
+                set_value(pass_input, password)
+                click_submit(must_locator(page, SELECTORS["sac_submit"], "sac_submit", DEFAULT_TIMEOUT_MS))
+            else:
+                user_input = must_locator(page, SELECTORS["login_username"], "login_username", DEFAULT_TIMEOUT_MS)
+                pass_input = must_locator(page, SELECTORS["login_password"], "login_password", DEFAULT_TIMEOUT_MS)
+                set_value(user_input, username)
+                set_value(pass_input, password)
+                click_submit(must_locator(page, SELECTORS["login_submit"], "login_submit", DEFAULT_TIMEOUT_MS))
+
+            ensure_authenticated_list(page)
+            return
+        except RuntimeError as exc:
+            last_exc = exc
+            message = str(exc)
+            retryable = (
+                "Login did not establish an authenticated session" in message
+                or "Missing or hidden element for sac_username" in message
+                or "Missing or hidden element for sac_password" in message
+                or "Missing or hidden element for login_username" in message
+                or "Missing or hidden element for login_password" in message
+            )
+            if not retryable or attempt >= max_attempts:
+                raise
+            page.wait_for_timeout(1000)
+
+    if last_exc is not None:
+        raise last_exc
+
+
 def choose_hut_option(page, hut_name):
     hut_input = must_locator(page, SELECTORS["hut_input"], "hut_input", DEFAULT_TIMEOUT_MS)
     target_norm = normalize_text(hut_name)
@@ -607,7 +650,7 @@ def first_visible_locator(locator):
                 return locator.nth(i)
         except Exception:
             continue
-    return locator.first if locator.count() else None
+    return None
 
 
 def expand_people_panel(page):
@@ -627,8 +670,11 @@ def expand_people_panel(page):
             except Exception:
                 panel_class = ""
             if "mat-expanded" not in panel_class:
-                header.click()
-                page.wait_for_timeout(250)
+                try:
+                    header.click()
+                    page.wait_for_timeout(250)
+                except Exception:
+                    return None
             return panel
     return None
 
@@ -685,11 +731,7 @@ def visible_people_inputs(page):
                 visible.append(candidate)
         except Exception:
             continue
-    if visible:
-        return visible
-    if inputs.count() == 1:
-        return [inputs.first]
-    return []
+    return visible
 
 
 def wait_for_visible_people_inputs(page, timeout_ms=5000):
@@ -706,6 +748,8 @@ def reclassify_party_size_error(exc):
     message = str(exc or "").strip()
     if message == "No people input found":
         return AvailabilityNotFoundError(message)
+    if message.startswith("Field 'room_type_people") and message.endswith("is not visible"):
+        return AvailabilityNotFoundError("No people input found")
     return None
 
 
@@ -836,8 +880,6 @@ def choose_people_input(page, room_type):
                 continue
         if len(visible_matches) == 1:
             return visible_matches[0]
-        if len(matches) == 1:
-            return matches[0]
 
         # Pragmatic fallback: if there's exactly one visible people input, use it.
         # This covers huts where the room categories are not named as "dormitorio/zimmer"
@@ -854,8 +896,18 @@ def choose_people_input(page, room_type):
             return visible_any[0]
 
         raise RuntimeError(f"No people input matched room_type '{room_type}'")
-    if inputs.count() == 1:
-        return inputs.first
+    visible_any = []
+    for i in range(inputs.count()):
+        cand = inputs.nth(i)
+        try:
+            if cand.is_visible():
+                visible_any.append(cand)
+        except Exception:
+            continue
+    if len(visible_any) == 1:
+        return visible_any[0]
+    if not visible_any:
+        raise RuntimeError("No people input found")
     raise RuntimeError("Multiple people inputs available; set preferences.room_type")
 
 
@@ -866,6 +918,12 @@ def fill_input_or_validate(locator, value, field_name):
         locator.scroll_into_view_if_needed()
     except Exception:
         pass
+    try:
+        if not locator.is_visible():
+            raise RuntimeError(f"Field '{field_name}' is not visible")
+    except Exception as exc:
+        if isinstance(exc, RuntimeError):
+            raise
     if locator.is_enabled():
         locator.click()
         locator.fill(str(value))
@@ -950,6 +1008,48 @@ def scroll_all_scrollables(page, direction="bottom", passes=6, pause_ms=200):
         page.wait_for_timeout(pause_ms)
         if not changed:
             break
+
+
+def clear_overlay_backdrops(page, timeout_ms=2000):
+    deadline = time.time() + (timeout_ms / 1000)
+    while time.time() < deadline:
+        backdrops = page.locator(".cdk-overlay-backdrop")
+        visible_backdrop = None
+        for i in range(backdrops.count()):
+            candidate = backdrops.nth(i)
+            try:
+                if candidate.is_visible():
+                    visible_backdrop = candidate
+                    break
+            except Exception:
+                continue
+        if visible_backdrop is None:
+            return
+        try:
+            page.keyboard.press("Escape")
+        except Exception:
+            pass
+        page.wait_for_timeout(150)
+        try:
+            visible_backdrop.click(force=True, timeout=500)
+        except Exception:
+            pass
+        page.wait_for_timeout(200)
+
+
+def click_with_overlay_retry(page, locator, timeout_ms=DEFAULT_TIMEOUT_MS):
+    clear_overlay_backdrops(page)
+    try:
+        locator.click(timeout=timeout_ms)
+        return
+    except PlaywrightTimeoutError:
+        clear_overlay_backdrops(page)
+    try:
+        locator.click(force=True, timeout=timeout_ms)
+        return
+    except PlaywrightTimeoutError:
+        clear_overlay_backdrops(page)
+        locator.evaluate("(el) => el.click()")
 
 
 def slugify(value):
@@ -1109,6 +1209,20 @@ def find_availability_next_button(page):
     return first_enabled_or_visible(page, selectors, "availability_next_button")
 
 
+def wait_for_availability_next_enabled(page, timeout_ms=4000):
+    deadline = time.time() + (timeout_ms / 1000)
+    button = find_availability_next_button(page)
+    while time.time() < deadline:
+        try:
+            if not button.is_disabled():
+                return button
+        except Exception:
+            pass
+        page.wait_for_timeout(250)
+        button = find_availability_next_button(page)
+    return button
+
+
 def find_waitlist_container(page):
     candidates = [
         "text=/lista d['\\u2019 ]?attesa/i",
@@ -1124,7 +1238,13 @@ def find_waitlist_container(page):
 def label_matches(text, labels):
     normalized = normalize_text(text)
     for label in labels:
-        if normalize_text(label) in normalized:
+        target = normalize_text(label)
+        if not target:
+            continue
+        if normalized == target:
+            return True
+        pattern = rf"(^|[^a-z0-9]){re.escape(target)}([^a-z0-9]|$)"
+        if re.search(pattern, normalized):
             return True
     return False
 
@@ -1812,6 +1932,212 @@ def find_summary_submit_button(page):
     raise RuntimeError("Summary submit button not found")
 
 
+def text_indicates_overlap_dialog(text):
+    normalized = normalize_text(text)
+    if not normalized:
+        return False
+
+    direct_phrases = [
+        "prenotazione multipla rilevata",
+        "hai gia prenotato uno o piu rifugi per questo periodo",
+        "gia una prenotazione",
+        "gia un'altra prenotazione",
+        "hai gia una prenotazione",
+        "hanno gia una prenotazione",
+        "stesso giorno",
+        "stessa data",
+        "same day",
+        "same date",
+        "already have a reservation",
+        "already have another reservation",
+        "bereits eine reservierung",
+        "bereits schon eine reservierung",
+        "an diesem tag",
+        "diesem datum",
+    ]
+    if any(phrase in normalized for phrase in direct_phrases):
+        return True
+
+    has_reservation = any(token in normalized for token in ["prenot", "reservation", "reservier", "buchung"])
+    has_time_conflict = any(
+        token in normalized
+        for token in ["stesso giorno", "stessa data", "same day", "same date", "an diesem tag", "diesem datum"]
+    )
+    has_continue = any(token in normalized for token in ["proced", "contin", "weiter", "fortfahr", "proceed"])
+    return has_reservation and has_time_conflict and has_continue
+
+
+def find_overlap_dialog(page):
+    dialogs = page.locator("[role='dialog'], mat-dialog-container, .cdk-overlay-pane")
+    for i in range(dialogs.count()):
+        dialog = dialogs.nth(i)
+        try:
+            if not dialog.is_visible():
+                continue
+            text = dialog.inner_text()
+        except Exception:
+            continue
+        if text_indicates_overlap_dialog(text):
+            return dialog
+    return None
+
+
+def click_overlap_dialog_continue(dialog):
+    labels = ["Ignora", "Ignore", "Continua", "Procedi", "Prosegui", "Continue", "Proceed", "Weiter", "Ja", "Si", "Sì", "OK"]
+    buttons = dialog.locator("button")
+    for i in range(buttons.count()):
+        button = buttons.nth(i)
+        try:
+            if not button.is_visible():
+                continue
+            text = button.inner_text()
+        except Exception:
+            continue
+        if not label_matches(text, labels):
+            continue
+        try:
+            button.click(timeout=DEFAULT_TIMEOUT_MS)
+        except PlaywrightTimeoutError:
+            button.click(force=True)
+        return True
+    return False
+
+
+def is_reservation_list_view(page):
+    url = page.url or ""
+    if url.startswith(LIST_URL):
+        return True
+    try:
+        body = normalize_text(page.locator("body").inner_text())
+    except Exception:
+        return False
+    return "le mie prenotazioni" in body and "aggiungi prenotazione" in body
+
+
+def is_payment_step(page):
+    selectors = [
+        "input[autocomplete='cc-number']",
+        "input[name*='cardnumber']",
+        "iframe[src*='stripe']",
+        "iframe[title*='card']",
+    ]
+    for selector in selectors:
+        locator = page.locator(selector)
+        if locator.count() == 0:
+            continue
+        for i in range(locator.count()):
+            candidate = locator.nth(i)
+            try:
+                if candidate.is_visible():
+                    return True
+            except Exception:
+                return True
+    try:
+        body = normalize_text(page.locator("body").inner_text())
+    except Exception:
+        return False
+    strong_markers = [
+        "perche abbiamo bisogno della tua carta di credito/debito",
+        "carta di credito/debito",
+        "si prega di verificare i dati della carta di credito",
+        "mastercard",
+        "visa",
+        "scadenza",
+    ]
+    if any(marker in body for marker in strong_markers):
+        return True
+    return (
+        ("dati carta di credito" in body or "credit card" in body or "kreditkarte" in body)
+        and ("numero di carta" in body or "card number" in body or "kartennummer" in body)
+    )
+
+
+def find_payment_action_button(page):
+    candidates = [
+        "button:has-text('INVIA')",
+        "button:has-text('Invia')",
+        "button:has-text('SENDEN')",
+        "button:has-text('Senden')",
+        "button:has-text('AVANTI')",
+        "button:has-text('Weiter')",
+        "button:has-text('WEITER')",
+    ]
+    for selector in candidates:
+        locator = page.locator(selector)
+        for i in range(locator.count()):
+            candidate = locator.nth(i)
+            try:
+                if candidate.is_visible():
+                    return candidate
+            except Exception:
+                continue
+    return None
+
+
+def advance_payment_flow(page, screenshot_dir, step, max_clicks=3):
+    clicked = False
+    for idx in range(max_clicks):
+        if not is_payment_step(page):
+            break
+        step = snap(page, screenshot_dir, step, f"payment_step_{idx + 1}")
+        action = find_payment_action_button(page)
+        if action is None:
+            break
+        try:
+            if action.is_disabled():
+                break
+        except Exception:
+            pass
+        click_with_overlay_retry(page, action)
+        clicked = True
+        page.wait_for_timeout(1200)
+        if is_reservation_list_view(page):
+            break
+    return step, clicked
+
+
+def wait_for_post_submit_state(page, screenshot_dir, step, timeout_ms=15000):
+    deadline = time.time() + (timeout_ms / 1000)
+    overlap_handled = False
+
+    while time.time() < deadline:
+        dialog = find_overlap_dialog(page)
+        if dialog is not None:
+            step = snap(page, screenshot_dir, step, "overlap_dialog")
+            if not click_overlap_dialog_continue(dialog):
+                raise RuntimeError("Overlap dialog appeared but no continue button was found.")
+            overlap_handled = True
+            page.wait_for_timeout(800)
+            step = snap(page, screenshot_dir, step, "overlap_dialog_confirmed")
+            continue
+
+        if is_payment_step(page):
+            return {"status": "payment_required", "overlap_dialog_handled": overlap_handled}, step
+        if is_reservation_list_view(page):
+            return {"status": "submitted", "overlap_dialog_handled": overlap_handled}, step
+
+        url = page.url or ""
+        if url and "/wizard" not in url and not url.startswith(LIST_URL):
+            return {"status": "submitted", "overlap_dialog_handled": overlap_handled}, step
+
+        page.wait_for_timeout(250)
+
+    step = snap(page, screenshot_dir, step, "post_submit_unknown")
+    return {"status": "submitted_unknown", "overlap_dialog_handled": overlap_handled}, step
+
+
+def handle_overlap_dialog_if_present(page, screenshot_dir, step):
+    dialog = find_overlap_dialog(page)
+    if dialog is None:
+        return step, False
+    step = snap(page, screenshot_dir, step, "overlap_dialog")
+    if not click_overlap_dialog_continue(dialog):
+        raise RuntimeError("Overlap dialog appeared but no continue button was found.")
+    page.wait_for_timeout(800)
+    step = snap(page, screenshot_dir, step, "overlap_dialog_confirmed")
+    return step, True
+
+
 def run_attempt(config, username, password, args, attempt_index=1):
     screenshot_dir = Path(args.screenshot_dir) if args.screenshot_dir else None
     if screenshot_dir is not None and (args.poll or config["auto_poll_if_full"]):
@@ -1825,26 +2151,8 @@ def run_attempt(config, username, password, args, attempt_index=1):
         page.set_default_timeout(DEFAULT_TIMEOUT_MS)
         step = 0
 
-        page.goto(f"{BASE_URL}/login", wait_until="domcontentloaded")
-        if config["login_provider"] == "sac":
-            sac_button = must_locator(page, SELECTORS["login_sac_button"], "login_sac_button", DEFAULT_TIMEOUT_MS)
-            sac_button.first.click()
-            page.wait_for_load_state("domcontentloaded")
-
-            user_input = must_locator(page, SELECTORS["sac_username"], "sac_username", DEFAULT_TIMEOUT_MS)
-            pass_input = must_locator(page, SELECTORS["sac_password"], "sac_password", DEFAULT_TIMEOUT_MS)
-            set_value(user_input, username)
-            set_value(pass_input, password)
-            click_submit(must_locator(page, SELECTORS["sac_submit"], "sac_submit", DEFAULT_TIMEOUT_MS))
-        else:
-            user_input = must_locator(page, SELECTORS["login_username"], "login_username", DEFAULT_TIMEOUT_MS)
-            pass_input = must_locator(page, SELECTORS["login_password"], "login_password", DEFAULT_TIMEOUT_MS)
-            set_value(user_input, username)
-            set_value(pass_input, password)
-            click_submit(must_locator(page, SELECTORS["login_submit"], "login_submit", DEFAULT_TIMEOUT_MS))
+        login_and_open_list(page, username, password, config["login_provider"])
         step = snap(page, screenshot_dir, step, "login")
-
-        ensure_authenticated_list(page)
         add_button = must_locator(page, SELECTORS["add_reservation_button"], "add_reservation_button", DEFAULT_TIMEOUT_MS)
         ensure_language_it(page)
         add_button.first.click()
@@ -1883,13 +2191,25 @@ def run_attempt(config, username, password, args, attempt_index=1):
                 raise mapped
             raise
         step = snap(page, screenshot_dir, step, "people_set")
-        ensure_expected_date_range(page, config["check_in"], config["check_out"], config["allow_alternative_dates"])
+        if not args.alert_only:
+            ensure_expected_date_range(page, config["check_in"], config["check_out"], config["allow_alternative_dates"])
 
-        if args.alert_only and free_places:
-            browser.close()
-            return {"status": "availability_found", **availability_probe}
+        if args.alert_only:
+            if free_places:
+                browser.close()
+                return {"status": "availability_found", **availability_probe}
+            raise AvailabilityNotFoundError("No positive free places shown on availability step.")
+        if (
+            not args.alert_only
+            and config.get("require_positive_free_places")
+            and not config["allow_waitlist"]
+            and not free_places
+        ):
+            raise AvailabilityNotFoundError("No positive free places shown on availability step.")
 
         next_check = find_availability_next_button(page)
+        if free_places:
+            next_check = wait_for_availability_next_enabled(page)
         if next_check.is_disabled() and config["allow_waitlist"]:
             scroll_all_scrollables(page, direction="bottom", passes=6, pause_ms=150)
             step = snap(page, screenshot_dir, step, "availability_scrolled_for_waitlist")
@@ -1901,12 +2221,15 @@ def run_attempt(config, username, password, args, attempt_index=1):
         if next_check.is_disabled():
             step = snap(page, screenshot_dir, step, "availability_next_still_disabled")
             raise AvailabilityNotFoundError("Availability step cannot continue (button disabled).")
-        try:
-            next_check.click(timeout=DEFAULT_TIMEOUT_MS)
-        except PlaywrightTimeoutError:
-            next_check.click(force=True)
+        click_with_overlay_retry(page, next_check)
 
-        if not availability_advanced(page, timeout_ms=8000):
+        advanced = availability_advanced(page, timeout_ms=8000)
+        if not advanced:
+            step, handled_overlap = handle_overlap_dialog_if_present(page, screenshot_dir, step)
+            if handled_overlap:
+                advanced = availability_advanced(page, timeout_ms=8000)
+
+        if not advanced:
             continue_button = find_availability_next_button(page)
             if continue_button.is_disabled() and config["allow_waitlist"]:
                 scroll_all_scrollables(page, direction="bottom", passes=6, pause_ms=150)
@@ -1919,10 +2242,16 @@ def run_attempt(config, username, password, args, attempt_index=1):
             if continue_button.is_disabled():
                 step = snap(page, screenshot_dir, step, "availability_continue_still_disabled")
                 raise AvailabilityNotFoundError("Availability step cannot continue (button disabled).")
-            continue_button.click()
+            click_with_overlay_retry(page, continue_button)
             page.wait_for_timeout(800)
+            advanced = availability_advanced(page, timeout_ms=8000)
 
-        if not availability_advanced(page, timeout_ms=8000):
+        if not advanced:
+            step, handled_overlap = handle_overlap_dialog_if_present(page, screenshot_dir, step)
+            if handled_overlap:
+                advanced = availability_advanced(page, timeout_ms=8000)
+
+        if not advanced:
             if config["allow_waitlist"]:
                 ensure_expected_date_range(page, config["check_in"], config["check_out"], allow_alternative_dates=False)
                 waitlist_enabled = enable_waitlist_if_present(page)
@@ -1938,12 +2267,13 @@ def run_attempt(config, username, password, args, attempt_index=1):
                     raise AvailabilityNotFoundError("Waiting list was enabled but continue button is still disabled.")
                 continue_button.click()
                 page.wait_for_timeout(800)
+                advanced = availability_advanced(page, timeout_ms=8000)
             elif not config["allow_alternative_dates"]:
                 raise AvailabilityNotFoundError(
                     "Requested dates not available. Set allow_alternative_dates or allow_waitlist to continue."
                 )
 
-        if not availability_advanced(page, timeout_ms=8000):
+        if not advanced:
             raise AvailabilityNotFoundError("Availability flow did not advance to overnight step.")
         step = snap(page, screenshot_dir, step, "availability_checked")
 
@@ -1986,7 +2316,11 @@ def run_attempt(config, username, password, args, attempt_index=1):
 
         fill_personal_value(page, ["Nome", "Vorname"], config["contact"]["first_name"])
         fill_personal_value(page, ["Cognome", "Nachname"], config["contact"]["last_name"])
-        fill_personal_value(page, ["Indirizzo 1", "Adresse 1", "Adresse"], config["contact"]["address_line1"])
+        fill_personal_value(
+            page,
+            ["Indirizzo 1", "Adresse 1", "Adresse", "Via e numero civico", "Strasse und Hausnummer"],
+            config["contact"]["address_line1"],
+        )
         fill_personal_value(page, ["CAP", "PLZ"], config["contact"]["postal_code"])
         fill_personal_value(page, ["Località", "Ort"], config["contact"]["city"])
         fill_personal_value(page, ["E-mail", "E-Mail", "Email"], config["contact"]["email"])
@@ -2026,11 +2360,14 @@ def run_attempt(config, username, password, args, attempt_index=1):
             maybe_pause("Paused before submit")
             browser.close()
             return {"status": "ready_to_submit"}
-        submit_btn.click()
+        click_with_overlay_retry(page, submit_btn)
         step = snap(page, screenshot_dir, step, "submission_clicked")
-        maybe_pause("Paused after submit")
+        if not args.pause_at_payment:
+            step, _ = advance_payment_flow(page, screenshot_dir, step)
+        post_submit_result, step = wait_for_post_submit_state(page, screenshot_dir, step)
+        maybe_pause(f"Paused after submit ({post_submit_result['status']})")
         browser.close()
-        return {"status": "submitted"}
+        return post_submit_result
 
 
 def config_label(config):
@@ -2220,6 +2557,28 @@ def record_closed_state(config, args, reason):
     )
 
 
+def record_error_state(config, args, error):
+    if args.dry_run:
+        print(f"[dry-run] {config_label(config)} error: {error}")
+        return
+
+    state_path = alert_state_path(config, args)
+    previous = load_alert_state(state_path)
+    save_alert_state(
+        state_path,
+        {
+            "status": "error",
+            "last_checked_at": iso_now(),
+            "last_reason": str(error),
+            "last_notified_at": previous.get("last_notified_at"),
+            "last_notification_mode": previous.get("last_notification_mode"),
+            "last_subject": previous.get("last_subject"),
+            "last_to": previous.get("last_to"),
+            "last_open_free_places": previous.get("last_open_free_places"),
+        },
+    )
+
+
 def summarize_availability_failures(configs, failures):
     parts = []
     for idx, exc in failures:
@@ -2281,6 +2640,13 @@ def main():
             return
         raise exc
 
+    def on_error(cfg, cfg_args, exc):
+        if cfg_args.alert_only:
+            record_error_state(cfg, cfg_args, exc)
+            print(f"{config_label(cfg)}: retrying after error: {exc}")
+            return
+        raise exc
+
     if len(configs) == 1:
         config = configs[0]
         config_args = args_per_config[0]
@@ -2304,6 +2670,10 @@ def main():
                     if not config_args.alert_only and max_attempts and attempt >= max_attempts:
                         raise
                     on_unavailable(config, config_args, exc)
+                except Exception as exc:
+                    if not config_args.alert_only and max_attempts and attempt >= max_attempts:
+                        raise
+                    on_error(config, config_args, exc)
                 if max_attempts and attempt >= max_attempts:
                     return
                 wait_time = interval_seconds + (random.randint(0, jitter_seconds) if jitter_seconds else 0)
@@ -2318,6 +2688,8 @@ def main():
                     on_unavailable(config, config_args, exc)
                 else:
                     raise
+            except Exception as exc:
+                on_error(config, config_args, exc)
         return
 
     if not poll_enabled:
@@ -2334,6 +2706,8 @@ def main():
                 else:
                     availability_failures.append((idx, exc))
                     print(f"{config_label(cfg)}: {exc}")
+            except Exception as exc:
+                on_error(cfg, cfg_args, exc)
         if availability_failures:
             raise AvailabilityNotFoundError(summarize_availability_failures(configs, availability_failures))
         return
@@ -2362,6 +2736,8 @@ def main():
                     on_unavailable(configs[idx], args_per_config[idx], exc)
                 else:
                     raise
+            except Exception as exc:
+                on_error(configs[idx], args_per_config[idx], exc)
 
     cycle = 0
     while pending:
@@ -2377,6 +2753,10 @@ def main():
                 if not args_per_config[idx].alert_only and max_attempts and cycle >= max_attempts:
                     raise
                 on_unavailable(configs[idx], args_per_config[idx], exc)
+            except Exception as exc:
+                if not args_per_config[idx].alert_only and max_attempts and cycle >= max_attempts:
+                    raise
+                on_error(configs[idx], args_per_config[idx], exc)
         if max_attempts and cycle >= max_attempts:
             return
         wait_time = interval_seconds + (random.randint(0, jitter_seconds) if jitter_seconds else 0)
